@@ -8,7 +8,7 @@ import fs from "fs";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Database initialization - TRY BASE64 DECODING FIRST
+// Database initialization - ALWAYS DECODE BASE64 IF AVAILABLE
 let db;
 const DB_PATH = "norms.db";
 const B64_PATH = "norms.db.b64";
@@ -16,9 +16,9 @@ const B64_PATH = "norms.db.b64";
 // Log what files exist
 console.log("📁 Files in directory:", fs.readdirSync('.').join(', '));
 
-// Check if we have a base64 encoded database to decode
-if (fs.existsSync(B64_PATH) && !fs.existsSync(DB_PATH)) {
-  console.log("🔓 Found base64 encoded database, decoding...");
+// ALWAYS decode base64 file if it exists (this ensures we have a fresh copy)
+if (fs.existsSync(B64_PATH)) {
+  console.log("🔓 Found base64 encoded database, decoding (this will overwrite any existing norms.db)...");
   try {
     const base64Data = fs.readFileSync(B64_PATH, 'utf8');
     const binaryData = Buffer.from(base64Data, 'base64');
@@ -52,9 +52,27 @@ if (fs.existsSync(DB_PATH)) {
   }
 }
 
-// If no valid database exists, create fresh one (should not happen if base64 worked)
+// If no valid database exists, try decoding one more time from base64
+if (!db && fs.existsSync(B64_PATH)) {
+  console.log("🔄 Retrying decode from base64...");
+  try {
+    const base64Data = fs.readFileSync(B64_PATH, 'utf8');
+    const binaryData = Buffer.from(base64Data, 'base64');
+    fs.writeFileSync(DB_PATH, binaryData);
+    console.log("✅ Database decoded on retry");
+    
+    // Try opening again
+    db = new Database(DB_PATH);
+    const count = db.prepare("SELECT COUNT(*) as count FROM norms").get();
+    console.log(`✅ Now opened with ${count.count} norms`);
+  } catch (error) {
+    console.error("❌ Retry failed:", error.message);
+  }
+}
+
+// If still no valid database, create fresh one (should not happen)
 if (!db) {
-  console.log("📦 Creating fresh database (base64 decode must have failed)...");
+  console.log("📦 Creating fresh database as last resort...");
   db = new Database(DB_PATH);
   console.log("✅ Fresh database created");
 }
@@ -336,10 +354,12 @@ async function startServer() {
     }
   }
 
+  // 404 for API
   app.use("/api/*", (req, res) => {
     res.status(404).json({ error: `API endpoint not found: ${req.originalUrl}` });
   });
 
+  // Global Error Handler
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
     console.error(err);
     res.status(500).json({ error: err.message || "Internal Server Error" });
