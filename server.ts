@@ -8,96 +8,119 @@ import fs from "fs";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const db = new Database("norms.db");
+// Database initialization with error handling
+let db;
+try {
+  // Try to open existing database
+  db = new Database("norms.db");
+  // Test if database is valid
+  db.prepare("SELECT 1").get();
+  console.log("✅ Existing database opened successfully");
+} catch (error) {
+  console.log("⚠️ Database corrupted or missing, creating fresh one...");
+  
+  // Delete corrupted file if it exists
+  if (fs.existsSync("norms.db")) {
+    fs.unlinkSync("norms.db");
+    console.log("🗑️ Corrupted database file deleted");
+  }
+  
+  // Create fresh database
+  db = new Database("norms.db");
+  console.log("✅ Fresh database created");
+}
 
-// Initialize Database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS norms (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT NOT NULL, -- 'DOR' or 'DUDBC'
-    description TEXT NOT NULL,
-    unit TEXT NOT NULL,
-    basis_quantity REAL DEFAULT 1.0,
-    ref_ss TEXT
-  );
+// Initialize Database Tables
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS norms (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL, -- 'DOR' or 'DUDBC'
+      description TEXT NOT NULL,
+      unit TEXT NOT NULL,
+      basis_quantity REAL DEFAULT 1.0,
+      ref_ss TEXT
+    );
 
-  CREATE TABLE IF NOT EXISTS norm_resources (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    norm_id INTEGER NOT NULL,
-    resource_type TEXT NOT NULL, -- 'Labour', 'Material', 'Equipment'
-    name TEXT NOT NULL,
-    unit TEXT,
-    quantity REAL NOT NULL,
-    is_percentage INTEGER DEFAULT 0,
-    percentage_base TEXT,
-    FOREIGN KEY (norm_id) REFERENCES norms(id) ON DELETE CASCADE
-  );
+    CREATE TABLE IF NOT EXISTS norm_resources (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      norm_id INTEGER NOT NULL,
+      resource_type TEXT NOT NULL, -- 'Labour', 'Material', 'Equipment'
+      name TEXT NOT NULL,
+      unit TEXT,
+      quantity REAL NOT NULL,
+      is_percentage INTEGER DEFAULT 0,
+      percentage_base TEXT,
+      FOREIGN KEY (norm_id) REFERENCES norms(id) ON DELETE CASCADE
+    );
 
-  CREATE TABLE IF NOT EXISTS rates (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    resource_type TEXT NOT NULL,
-    name TEXT NOT NULL UNIQUE,
-    unit TEXT NOT NULL,
-    rate REAL NOT NULL,
-    apply_vat INTEGER DEFAULT 0
-  );
+    CREATE TABLE IF NOT EXISTS rates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      resource_type TEXT NOT NULL,
+      name TEXT NOT NULL UNIQUE,
+      unit TEXT NOT NULL,
+      rate REAL NOT NULL,
+      apply_vat INTEGER DEFAULT 0
+    );
 
-  CREATE TABLE IF NOT EXISTS projects (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    description TEXT,
-    mode TEXT DEFAULT 'CONTRACTOR', -- 'CONTRACTOR' or 'USERS'
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+    CREATE TABLE IF NOT EXISTS projects (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      description TEXT,
+      mode TEXT DEFAULT 'CONTRACTOR', -- 'CONTRACTOR' or 'USERS'
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS boq_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id INTEGER NOT NULL,
-    norm_id INTEGER NOT NULL,
-    quantity REAL NOT NULL,
-    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-    FOREIGN KEY (norm_id) REFERENCES norms(id)
-  );
-`);
+    CREATE TABLE IF NOT EXISTS boq_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      norm_id INTEGER NOT NULL,
+      quantity REAL NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (norm_id) REFERENCES norms(id)
+    );
+  `);
+  console.log("✅ Database tables initialized");
+} catch (error) {
+  console.error("❌ Failed to initialize tables:", error);
+  process.exit(1);
+}
 
 async function startServer() {
   console.log("Starting server...");
   const app = express();
   app.use(express.json());
-  const PORT = 3000;
+  
+  // Use PORT from environment or default to 3000
+  const PORT = process.env.PORT || 3000;
 
-  // Migration: Add unit column to norm_resources if it doesn't exist
+  // Run migrations safely
   try {
     db.prepare("ALTER TABLE norm_resources ADD COLUMN unit TEXT").run();
   } catch (e) {}
 
-  // Migration: Add basis_quantity column to norms if it doesn't exist
   try {
     db.prepare("ALTER TABLE norms ADD COLUMN basis_quantity REAL DEFAULT 1.0").run();
   } catch (e) {}
 
-  // Migration: Add apply_vat column to rates if it doesn't exist
   try {
     db.prepare("ALTER TABLE rates ADD COLUMN apply_vat INTEGER DEFAULT 0").run();
   } catch (e) {}
 
-  // Migration: Add is_percentage column to norm_resources if it doesn't exist
   try {
     db.prepare("ALTER TABLE norm_resources ADD COLUMN is_percentage INTEGER DEFAULT 0").run();
   } catch (e) {}
 
-  // Migration: Add percentage_base column to norm_resources if it doesn't exist
   try {
     db.prepare("ALTER TABLE norm_resources ADD COLUMN percentage_base TEXT").run();
   } catch (e) {}
 
-  // Migration: Add mode column to projects if it doesn't exist
   try {
     db.prepare("ALTER TABLE projects ADD COLUMN mode TEXT DEFAULT 'CONTRACTOR'").run();
   } catch (e) {}
 
-  // --- API Routes ---
-
+  // --- API Routes (your existing routes remain exactly the same from here) ---
+  
   // Health Check
   app.get("/api/health", (req, res) => {
     try {
@@ -138,12 +161,10 @@ async function startServer() {
     for (const resource of resources) {
       insertResource.run(normId, resource.resource_type, resource.name, resource.unit, resource.quantity, resource.is_percentage ? 1 : 0, resource.percentage_base || null);
       
-      // Automatic Sync to Rates
       const existingRate = checkRate.get(resource.name);
       if (!existingRate) {
         insertRate.run(resource.resource_type, resource.name, resource.unit || '-', 0);
       } else {
-        // Update unit and type from norms (Norms are source of truth for metadata)
         updateRateMeta.run(resource.resource_type, resource.unit || existingRate.unit, resource.name);
       }
     }
@@ -164,12 +185,10 @@ async function startServer() {
     for (const resource of resources) {
       insertResource.run(id, resource.resource_type, resource.name, resource.unit, resource.quantity, resource.is_percentage ? 1 : 0, resource.percentage_base || null);
       
-      // Automatic Sync to Rates
       const existingRate = checkRate.get(resource.name);
       if (!existingRate) {
         insertRate.run(resource.resource_type, resource.name, resource.unit || '-', 0);
       } else {
-        // Update unit and type from norms (Norms are source of truth for metadata)
         updateRateMeta.run(resource.resource_type, resource.unit || existingRate.unit, resource.name);
       }
     }
@@ -235,7 +254,6 @@ async function startServer() {
       WHERE b.project_id = ?
     `).all(req.params.id);
     
-    // Add resources for each item
     const itemsWithResources = items.map((item: any) => {
       const resources = db.prepare("SELECT * FROM norm_resources WHERE norm_id = ?").all(item.norm_id);
       return { ...item, resources };
@@ -305,8 +323,11 @@ async function startServer() {
   });
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:\${PORT}`);
+    console.log(`Server running on port ${PORT}`);
   });
 }
 
-startServer();
+startServer().catch(err => {
+  console.error("Failed to start server:", err);
+  process.exit(1);
+});
