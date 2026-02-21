@@ -8,26 +8,71 @@ import fs from "fs";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Database initialization with error handling
+// Database initialization with improved error handling
 let db;
-try {
-  // Try to open existing database
-  db = new Database("norms.db");
-  // Test if database is valid
-  db.prepare("SELECT 1").get();
-  console.log("✅ Existing database opened successfully");
-} catch (error) {
-  console.log("⚠️ Database corrupted or missing, creating fresh one...");
-  
-  // Delete corrupted file if it exists
-  if (fs.existsSync("norms.db")) {
-    fs.unlinkSync("norms.db");
-    console.log("🗑️ Corrupted database file deleted");
+const DB_PATH = "norms.db";
+
+function initializeDatabase() {
+  try {
+    // Try to open existing database
+    db = new Database(DB_PATH);
+    
+    // Test if database is valid and writable
+    db.prepare("SELECT 1").get();
+    
+    // Test write permission
+    db.exec("CREATE TABLE IF NOT EXISTS _test (id INTEGER)");
+    db.exec("DROP TABLE _test");
+    
+    console.log("✅ Existing database opened successfully");
+    return true;
+  } catch (error) {
+    console.log("⚠️ Database issue detected:", error.message);
+    
+    // Try to recover
+    try {
+      // Close connection if open
+      if (db) {
+        try { db.close(); } catch (e) {}
+      }
+      
+      // Delete corrupted file if it exists
+      if (fs.existsSync(DB_PATH)) {
+        fs.unlinkSync(DB_PATH);
+        console.log("🗑️ Corrupted database file deleted");
+      }
+      
+      // Create fresh database
+      db = new Database(DB_PATH);
+      console.log("✅ Fresh database created");
+      return true;
+    } catch (createError) {
+      console.error("❌ Failed to create database:", createError);
+      return false;
+    }
   }
+}
+
+// Initialize database with retry
+let dbInitialized = false;
+let retryCount = 0;
+const MAX_RETRIES = 3;
+
+while (!dbInitialized && retryCount < MAX_RETRIES) {
+  retryCount++;
+  console.log(`📦 Database initialization attempt ${retryCount}/${MAX_RETRIES}`);
+  dbInitialized = initializeDatabase();
   
-  // Create fresh database
-  db = new Database("norms.db");
-  console.log("✅ Fresh database created");
+  if (!dbInitialized && retryCount < MAX_RETRIES) {
+    console.log("⏳ Waiting 1 second before retry...");
+    // Simple sync wait - don't use setTimeout in sync context
+    for (let i = 0; i < 100000000; i++) {} // Roughly 1 second delay
+  }
+}
+
+if (!dbInitialized) {
+  console.error("❌ Could not initialize database after multiple attempts");
+  process.exit(1);
 }
 
 // Initialize Database Tables
@@ -119,7 +164,7 @@ async function startServer() {
     db.prepare("ALTER TABLE projects ADD COLUMN mode TEXT DEFAULT 'CONTRACTOR'").run();
   } catch (e) {}
 
-  // --- API Routes (your existing routes remain exactly the same from here) ---
+  // --- API Routes ---
   
   // Health Check
   app.get("/api/health", (req, res) => {
@@ -302,13 +347,30 @@ async function startServer() {
       }
     });
   } else {
-    app.use(express.static(path.join(__dirname, "dist")));
-    app.get("*", (req, res, next) => {
-      if (req.originalUrl.startsWith('/api')) {
-        return next();
-      }
-      res.sendFile(path.join(__dirname, "dist", "index.html"));
-    });
+    // Production mode - serve static files
+    const distPath = path.join(__dirname, "dist");
+    if (fs.existsSync(distPath)) {
+      app.use(express.static(distPath));
+      app.get("*", (req, res, next) => {
+        if (req.originalUrl.startsWith('/api')) {
+          return next();
+        }
+        const indexPath = path.join(distPath, "index.html");
+        if (fs.existsSync(indexPath)) {
+          res.sendFile(indexPath);
+        } else {
+          res.status(404).send("Frontend build not found");
+        }
+      });
+    } else {
+      console.log("⚠️ dist folder not found, API only mode");
+      app.get("*", (req, res, next) => {
+        if (req.originalUrl.startsWith('/api')) {
+          return next();
+        }
+        res.status(404).json({ error: "Frontend not built" });
+      });
+    }
   }
 
   // 404 for API
@@ -322,12 +384,16 @@ async function startServer() {
     res.status(500).json({ error: err.message || "Internal Server Error" });
   });
 
+/*************  ✨ Windsurf Command 🌟  *************/
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}, accessible at http://localhost:${PORT}`);
+/*******  81c0214e-7b4c-43e9-9af1-eb1a6bee9800  *******/
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
   });
 }
 
 startServer().catch(err => {
-  console.error("Failed to start server:", err);
+  console.error("❌ Failed to start server:", err);
   process.exit(1);
 });
