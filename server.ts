@@ -8,74 +8,51 @@ import fs from "fs";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Database initialization with improved error handling
+// Database initialization - USE EXISTING DATABASE IF PRESENT
 let db;
 const DB_PATH = "norms.db";
 
-function initializeDatabase() {
+// Check if database file exists from GitHub
+if (fs.existsSync(DB_PATH)) {
   try {
     // Try to open existing database
     db = new Database(DB_PATH);
-    
-    // Test if database is valid and writable
+    // Test if database is valid
     db.prepare("SELECT 1").get();
     
-    // Test write permission
-    db.exec("CREATE TABLE IF NOT EXISTS _test (id INTEGER)");
-    db.exec("DROP TABLE _test");
-    
-    console.log("✅ Existing database opened successfully");
-    return true;
+    // Count norms to verify data
+    const count = db.prepare("SELECT COUNT(*) as count FROM norms").get();
+    console.log(`✅ Existing database opened with ${count.count} norms`);
   } catch (error) {
-    console.log("⚠️ Database issue detected:", error.message);
+    console.log("⚠️ Existing database corrupted, will create fresh one:", error.message);
+    db = null;
     
-    // Try to recover
+    // Delete corrupted file
     try {
-      // Close connection if open
-      if (db) {
-        try { db.close(); } catch (e) {}
-      }
-      
-      // Delete corrupted file if it exists
-      if (fs.existsSync(DB_PATH)) {
-        fs.unlinkSync(DB_PATH);
-        console.log("🗑️ Corrupted database file deleted");
-      }
-      
-      // Create fresh database
-      db = new Database(DB_PATH);
-      console.log("✅ Fresh database created");
-      return true;
-    } catch (createError) {
-      console.error("❌ Failed to create database:", createError);
-      return false;
-    }
+      fs.unlinkSync(DB_PATH);
+      console.log("🗑️ Corrupted database file deleted");
+    } catch (e) {}
   }
 }
 
-// Initialize database with retry
-let dbInitialized = false;
-let retryCount = 0;
-const MAX_RETRIES = 3;
-
-while (!dbInitialized && retryCount < MAX_RETRIES) {
-  retryCount++;
-  console.log(`📦 Database initialization attempt ${retryCount}/${MAX_RETRIES}`);
-  dbInitialized = initializeDatabase();
+// If no valid database exists, create fresh one
+if (!db) {
+  console.log("📦 Creating fresh database...");
   
-  if (!dbInitialized && retryCount < MAX_RETRIES) {
-    console.log("⏳ Waiting 1 second before retry...");
-    // Simple sync wait - don't use setTimeout in sync context
-    for (let i = 0; i < 100000000; i++) {} // Roughly 1 second delay
+  // Delete corrupted file if it exists (though we already tried)
+  if (fs.existsSync(DB_PATH)) {
+    try {
+      fs.unlinkSync(DB_PATH);
+      console.log("🗑️ Corrupted database file deleted");
+    } catch (e) {}
   }
+  
+  // Create fresh database
+  db = new Database(DB_PATH);
+  console.log("✅ Fresh database created");
 }
 
-if (!dbInitialized) {
-  console.error("❌ Could not initialize database after multiple attempts");
-  process.exit(1);
-}
-
-// Initialize Database Tables
+// Initialize Database Tables (only if fresh or need tables)
 try {
   db.exec(`
     CREATE TABLE IF NOT EXISTS norms (
@@ -139,7 +116,7 @@ async function startServer() {
   // Use PORT from environment or default to 3000
   const PORT = process.env.PORT || 3000;
 
-  // Run migrations safely
+  // Run migrations safely (these won't harm existing data)
   try {
     db.prepare("ALTER TABLE norm_resources ADD COLUMN unit TEXT").run();
   } catch (e) {}
@@ -170,7 +147,12 @@ async function startServer() {
   app.get("/api/health", (req, res) => {
     try {
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
-      res.json({ status: "ok", tables });
+      const normsCount = db.prepare("SELECT COUNT(*) as count FROM norms").get();
+      res.json({ 
+        status: "ok", 
+        tables,
+        normsCount: normsCount.count
+      });
     } catch (e: any) {
       res.status(500).json({ status: "error", message: e.message });
     }
@@ -384,10 +366,7 @@ async function startServer() {
     res.status(500).json({ error: err.message || "Internal Server Error" });
   });
 
-/*************  ✨ Windsurf Command 🌟  *************/
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}, accessible at http://localhost:${PORT}`);
-/*******  81c0214e-7b4c-43e9-9af1-eb1a6bee9800  *******/
     console.log(`🚀 Server running on port ${PORT}`);
     console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
   });
