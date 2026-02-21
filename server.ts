@@ -8,11 +8,28 @@ import fs from "fs";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Database initialization - USE EXISTING DATABASE IF PRESENT
+// Database initialization - TRY BASE64 DECODING FIRST
 let db;
 const DB_PATH = "norms.db";
+const B64_PATH = "norms.db.b64";
 
-// Check if database file exists from GitHub
+// Log what files exist
+console.log("📁 Files in directory:", fs.readdirSync('.').join(', '));
+
+// Check if we have a base64 encoded database to decode
+if (fs.existsSync(B64_PATH) && !fs.existsSync(DB_PATH)) {
+  console.log("🔓 Found base64 encoded database, decoding...");
+  try {
+    const base64Data = fs.readFileSync(B64_PATH, 'utf8');
+    const binaryData = Buffer.from(base64Data, 'base64');
+    fs.writeFileSync(DB_PATH, binaryData);
+    console.log("✅ Database decoded successfully from base64");
+  } catch (error) {
+    console.error("❌ Failed to decode base64 database:", error.message);
+  }
+}
+
+// Now try to open the database
 if (fs.existsSync(DB_PATH)) {
   try {
     // Try to open existing database
@@ -22,9 +39,9 @@ if (fs.existsSync(DB_PATH)) {
     
     // Count norms to verify data
     const count = db.prepare("SELECT COUNT(*) as count FROM norms").get();
-    console.log(`✅ Existing database opened with ${count.count} norms`);
+    console.log(`✅ Database opened successfully with ${count.count} norms`);
   } catch (error) {
-    console.log("⚠️ Existing database corrupted, will create fresh one:", error.message);
+    console.log("⚠️ Error opening database:", error.message);
     db = null;
     
     // Delete corrupted file
@@ -35,77 +52,74 @@ if (fs.existsSync(DB_PATH)) {
   }
 }
 
-// If no valid database exists, create fresh one
+// If no valid database exists, create fresh one (should not happen if base64 worked)
 if (!db) {
-  console.log("📦 Creating fresh database...");
-  
-  // Delete corrupted file if it exists (though we already tried)
-  if (fs.existsSync(DB_PATH)) {
-    try {
-      fs.unlinkSync(DB_PATH);
-      console.log("🗑️ Corrupted database file deleted");
-    } catch (e) {}
-  }
-  
-  // Create fresh database
+  console.log("📦 Creating fresh database (base64 decode must have failed)...");
   db = new Database(DB_PATH);
   console.log("✅ Fresh database created");
 }
 
-// Initialize Database Tables (only if fresh or need tables)
+// Initialize Database Tables (only if fresh)
 try {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS norms (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      type TEXT NOT NULL, -- 'DOR' or 'DUDBC'
-      description TEXT NOT NULL,
-      unit TEXT NOT NULL,
-      basis_quantity REAL DEFAULT 1.0,
-      ref_ss TEXT
-    );
+  // Check if tables exist by looking for norms table
+  const tableCheck = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='norms'").get();
+  
+  if (!tableCheck) {
+    console.log("📊 Creating database tables...");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS norms (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL,
+        description TEXT NOT NULL,
+        unit TEXT NOT NULL,
+        basis_quantity REAL DEFAULT 1.0,
+        ref_ss TEXT
+      );
 
-    CREATE TABLE IF NOT EXISTS norm_resources (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      norm_id INTEGER NOT NULL,
-      resource_type TEXT NOT NULL, -- 'Labour', 'Material', 'Equipment'
-      name TEXT NOT NULL,
-      unit TEXT,
-      quantity REAL NOT NULL,
-      is_percentage INTEGER DEFAULT 0,
-      percentage_base TEXT,
-      FOREIGN KEY (norm_id) REFERENCES norms(id) ON DELETE CASCADE
-    );
+      CREATE TABLE IF NOT EXISTS norm_resources (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        norm_id INTEGER NOT NULL,
+        resource_type TEXT NOT NULL,
+        name TEXT NOT NULL,
+        unit TEXT,
+        quantity REAL NOT NULL,
+        is_percentage INTEGER DEFAULT 0,
+        percentage_base TEXT,
+        FOREIGN KEY (norm_id) REFERENCES norms(id) ON DELETE CASCADE
+      );
 
-    CREATE TABLE IF NOT EXISTS rates (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      resource_type TEXT NOT NULL,
-      name TEXT NOT NULL UNIQUE,
-      unit TEXT NOT NULL,
-      rate REAL NOT NULL,
-      apply_vat INTEGER DEFAULT 0
-    );
+      CREATE TABLE IF NOT EXISTS rates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_type TEXT NOT NULL,
+        name TEXT NOT NULL UNIQUE,
+        unit TEXT NOT NULL,
+        rate REAL NOT NULL,
+        apply_vat INTEGER DEFAULT 0
+      );
 
-    CREATE TABLE IF NOT EXISTS projects (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      description TEXT,
-      mode TEXT DEFAULT 'CONTRACTOR', -- 'CONTRACTOR' or 'USERS'
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
+      CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT,
+        mode TEXT DEFAULT 'CONTRACTOR',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
 
-    CREATE TABLE IF NOT EXISTS boq_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      project_id INTEGER NOT NULL,
-      norm_id INTEGER NOT NULL,
-      quantity REAL NOT NULL,
-      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-      FOREIGN KEY (norm_id) REFERENCES norms(id)
-    );
-  `);
-  console.log("✅ Database tables initialized");
+      CREATE TABLE IF NOT EXISTS boq_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        norm_id INTEGER NOT NULL,
+        quantity REAL NOT NULL,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+        FOREIGN KEY (norm_id) REFERENCES norms(id)
+      );
+    `);
+    console.log("✅ Database tables initialized");
+  } else {
+    console.log("✅ Database tables already exist");
+  }
 } catch (error) {
   console.error("❌ Failed to initialize tables:", error);
-  process.exit(1);
 }
 
 async function startServer() {
@@ -113,36 +127,16 @@ async function startServer() {
   const app = express();
   app.use(express.json());
   
-  // Use PORT from environment or default to 3000
   const PORT = process.env.PORT || 3000;
 
-  // Run migrations safely (these won't harm existing data)
-  try {
-    db.prepare("ALTER TABLE norm_resources ADD COLUMN unit TEXT").run();
-  } catch (e) {}
+  // Run migrations safely
+  try { db.prepare("ALTER TABLE norm_resources ADD COLUMN unit TEXT").run(); } catch (e) {}
+  try { db.prepare("ALTER TABLE norms ADD COLUMN basis_quantity REAL DEFAULT 1.0").run(); } catch (e) {}
+  try { db.prepare("ALTER TABLE rates ADD COLUMN apply_vat INTEGER DEFAULT 0").run(); } catch (e) {}
+  try { db.prepare("ALTER TABLE norm_resources ADD COLUMN is_percentage INTEGER DEFAULT 0").run(); } catch (e) {}
+  try { db.prepare("ALTER TABLE norm_resources ADD COLUMN percentage_base TEXT").run(); } catch (e) {}
+  try { db.prepare("ALTER TABLE projects ADD COLUMN mode TEXT DEFAULT 'CONTRACTOR'").run(); } catch (e) {}
 
-  try {
-    db.prepare("ALTER TABLE norms ADD COLUMN basis_quantity REAL DEFAULT 1.0").run();
-  } catch (e) {}
-
-  try {
-    db.prepare("ALTER TABLE rates ADD COLUMN apply_vat INTEGER DEFAULT 0").run();
-  } catch (e) {}
-
-  try {
-    db.prepare("ALTER TABLE norm_resources ADD COLUMN is_percentage INTEGER DEFAULT 0").run();
-  } catch (e) {}
-
-  try {
-    db.prepare("ALTER TABLE norm_resources ADD COLUMN percentage_base TEXT").run();
-  } catch (e) {}
-
-  try {
-    db.prepare("ALTER TABLE projects ADD COLUMN mode TEXT DEFAULT 'CONTRACTOR'").run();
-  } catch (e) {}
-
-  // --- API Routes ---
-  
   // Health Check
   app.get("/api/health", (req, res) => {
     try {
@@ -160,7 +154,6 @@ async function startServer() {
 
   // Norms
   app.get("/api/norms", (req, res) => {
-    console.log("GET /api/norms hit");
     try {
       const norms = db.prepare("SELECT * FROM norms").all();
       const result = norms.map((norm: any) => {
@@ -169,7 +162,6 @@ async function startServer() {
       });
       res.json(result);
     } catch (e: any) {
-      console.error("Error in GET /api/norms:", e);
       res.status(500).json({ error: e.message });
     }
   });
@@ -230,11 +222,9 @@ async function startServer() {
 
   // Rates
   app.get("/api/rates", (req, res) => {
-    console.log("GET /api/rates hit");
     try {
       res.json(db.prepare("SELECT * FROM rates").all());
     } catch (e: any) {
-      console.error("Error in GET /api/rates:", e);
       res.status(500).json({ error: e.message });
     }
   });
@@ -262,11 +252,9 @@ async function startServer() {
 
   // Projects
   app.get("/api/projects", (req, res) => {
-    console.log("GET /api/projects hit");
     try {
       res.json(db.prepare("SELECT * FROM projects ORDER BY created_at DESC").all());
     } catch (e: any) {
-      console.error("Error in GET /api/projects:", e);
       res.status(500).json({ error: e.message });
     }
   });
@@ -306,7 +294,7 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  // Vite middleware for development
+  // Vite middleware
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -316,9 +304,7 @@ async function startServer() {
     
     app.use("*", async (req, res, next) => {
       const url = req.originalUrl;
-      if (url.startsWith('/api')) {
-        return next();
-      }
+      if (url.startsWith('/api')) return next();
       try {
         let template = fs.readFileSync(path.resolve(__dirname, "index.html"), "utf-8");
         template = await vite.transformIndexHtml(url, template);
@@ -329,14 +315,11 @@ async function startServer() {
       }
     });
   } else {
-    // Production mode - serve static files
     const distPath = path.join(__dirname, "dist");
     if (fs.existsSync(distPath)) {
       app.use(express.static(distPath));
       app.get("*", (req, res, next) => {
-        if (req.originalUrl.startsWith('/api')) {
-          return next();
-        }
+        if (req.originalUrl.startsWith('/api')) return next();
         const indexPath = path.join(distPath, "index.html");
         if (fs.existsSync(indexPath)) {
           res.sendFile(indexPath);
@@ -347,20 +330,16 @@ async function startServer() {
     } else {
       console.log("⚠️ dist folder not found, API only mode");
       app.get("*", (req, res, next) => {
-        if (req.originalUrl.startsWith('/api')) {
-          return next();
-        }
+        if (req.originalUrl.startsWith('/api')) return next();
         res.status(404).json({ error: "Frontend not built" });
       });
     }
   }
 
-  // 404 for API
   app.use("/api/*", (req, res) => {
     res.status(404).json({ error: `API endpoint not found: ${req.originalUrl}` });
   });
 
-  // Global Error Handler
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
     console.error(err);
     res.status(500).json({ error: err.message || "Internal Server Error" });
@@ -368,7 +347,8 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+    const count = db.prepare("SELECT COUNT(*) as count FROM norms").get();
+    console.log(`📊 Database has ${count.count} norms`);
   });
 }
 
