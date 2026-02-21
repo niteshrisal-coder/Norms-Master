@@ -1,92 +1,44 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
-import Database from "better-sqlite3";
 import path from "path";
 import { fileURLToPath } from 'url';
 import fs from "fs";
+import pg from 'pg';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Database initialization - ALWAYS DECODE BASE64 IF AVAILABLE
-let db;
-const DB_PATH = "norms.db";
-const B64_PATH = "norms.db.b64";
+// PostgreSQL connection
+const { Pool } = pg;
+let pool;
 
-// Log what files exist
-console.log("📁 Files in directory:", fs.readdirSync('.').join(', '));
-
-// ALWAYS decode base64 file if it exists (this ensures we have a fresh copy)
-if (fs.existsSync(B64_PATH)) {
-  console.log("🔓 Found base64 encoded database, decoding (this will overwrite any existing norms.db)...");
-  try {
-    const base64Data = fs.readFileSync(B64_PATH, 'utf8');
-    const binaryData = Buffer.from(base64Data, 'base64');
-    fs.writeFileSync(DB_PATH, binaryData);
-    console.log("✅ Database decoded successfully from base64");
-  } catch (error) {
-    console.error("❌ Failed to decode base64 database:", error.message);
-  }
-}
-
-// Now try to open the database
-if (fs.existsSync(DB_PATH)) {
-  try {
-    // Try to open existing database
-    db = new Database(DB_PATH);
-    // Test if database is valid
-    db.prepare("SELECT 1").get();
-    
-    // Count norms to verify data
-    const count = db.prepare("SELECT COUNT(*) as count FROM norms").get();
-    console.log(`✅ Database opened successfully with ${count.count} norms`);
-  } catch (error) {
-    console.log("⚠️ Error opening database:", error.message);
-    db = null;
-    
-    // Delete corrupted file
-    try {
-      fs.unlinkSync(DB_PATH);
-      console.log("🗑️ Corrupted database file deleted");
-    } catch (e) {}
-  }
-}
-
-// If no valid database exists, try decoding one more time from base64
-if (!db && fs.existsSync(B64_PATH)) {
-  console.log("🔄 Retrying decode from base64...");
-  try {
-    const base64Data = fs.readFileSync(B64_PATH, 'utf8');
-    const binaryData = Buffer.from(base64Data, 'base64');
-    fs.writeFileSync(DB_PATH, binaryData);
-    console.log("✅ Database decoded on retry");
-    
-    // Try opening again
-    db = new Database(DB_PATH);
-    const count = db.prepare("SELECT COUNT(*) as count FROM norms").get();
-    console.log(`✅ Now opened with ${count.count} norms`);
-  } catch (error) {
-    console.error("❌ Retry failed:", error.message);
-  }
-}
-
-// If still no valid database, create fresh one (should not happen)
-if (!db) {
-  console.log("📦 Creating fresh database as last resort...");
-  db = new Database(DB_PATH);
-  console.log("✅ Fresh database created");
-}
-
-// Initialize Database Tables (only if fresh)
 try {
-  // Check if tables exist by looking for norms table
-  const tableCheck = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='norms'").get();
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    console.error("❌ DATABASE_URL environment variable not set!");
+    process.exit(1);
+  }
   
-  if (!tableCheck) {
-    console.log("📊 Creating database tables...");
-    db.exec(`
+  pool = new Pool({
+    connectionString: databaseUrl,
+    ssl: {
+      rejectUnauthorized: false // Required for Render PostgreSQL
+    }
+  });
+  
+  console.log("✅ Connected to PostgreSQL database");
+} catch (error) {
+  console.error("❌ Failed to connect to PostgreSQL:", error);
+  process.exit(1);
+}
+
+// Initialize Database Tables
+async function initializeDatabase() {
+  try {
+    // Create tables if they don't exist
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS norms (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         type TEXT NOT NULL,
         description TEXT NOT NULL,
         unit TEXT NOT NULL,
@@ -95,19 +47,18 @@ try {
       );
 
       CREATE TABLE IF NOT EXISTS norm_resources (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        norm_id INTEGER NOT NULL,
+        id SERIAL PRIMARY KEY,
+        norm_id INTEGER NOT NULL REFERENCES norms(id) ON DELETE CASCADE,
         resource_type TEXT NOT NULL,
         name TEXT NOT NULL,
         unit TEXT,
         quantity REAL NOT NULL,
         is_percentage INTEGER DEFAULT 0,
-        percentage_base TEXT,
-        FOREIGN KEY (norm_id) REFERENCES norms(id) ON DELETE CASCADE
+        percentage_base TEXT
       );
 
       CREATE TABLE IF NOT EXISTS rates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         resource_type TEXT NOT NULL,
         name TEXT NOT NULL UNIQUE,
         unit TEXT NOT NULL,
@@ -116,54 +67,62 @@ try {
       );
 
       CREATE TABLE IF NOT EXISTS projects (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
         description TEXT,
         mode TEXT DEFAULT 'CONTRACTOR',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
       CREATE TABLE IF NOT EXISTS boq_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id INTEGER NOT NULL,
-        norm_id INTEGER NOT NULL,
-        quantity REAL NOT NULL,
-        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-        FOREIGN KEY (norm_id) REFERENCES norms(id)
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        norm_id INTEGER NOT NULL REFERENCES norms(id),
+        quantity REAL NOT NULL
       );
     `);
-    console.log("✅ Database tables initialized");
-  } else {
-    console.log("✅ Database tables already exist");
+    
+    // Run migrations safely
+    try {
+      await pool.query(`ALTER TABLE norm_resources ADD COLUMN IF NOT EXISTS unit TEXT`);
+      await pool.query(`ALTER TABLE norms ADD COLUMN IF NOT EXISTS basis_quantity REAL DEFAULT 1.0`);
+      await pool.query(`ALTER TABLE rates ADD COLUMN IF NOT EXISTS apply_vat INTEGER DEFAULT 0`);
+      await pool.query(`ALTER TABLE norm_resources ADD COLUMN IF NOT EXISTS is_percentage INTEGER DEFAULT 0`);
+      await pool.query(`ALTER TABLE norm_resources ADD COLUMN IF NOT EXISTS percentage_base TEXT`);
+      await pool.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'CONTRACTOR'`);
+    } catch (e) {
+      // Ignore migration errors
+    }
+    
+    // Check if we have any data
+    const result = await pool.query("SELECT COUNT(*) FROM norms");
+    console.log(`✅ Database initialized with ${result.rows[0].count} norms`);
+  } catch (error) {
+    console.error("❌ Failed to initialize database:", error);
+    process.exit(1);
   }
-} catch (error) {
-  console.error("❌ Failed to initialize tables:", error);
 }
 
 async function startServer() {
+  await initializeDatabase();
+  
   console.log("Starting server...");
   const app = express();
   app.use(express.json());
   
   const PORT = process.env.PORT || 3000;
 
-  // Run migrations safely
-  try { db.prepare("ALTER TABLE norm_resources ADD COLUMN unit TEXT").run(); } catch (e) {}
-  try { db.prepare("ALTER TABLE norms ADD COLUMN basis_quantity REAL DEFAULT 1.0").run(); } catch (e) {}
-  try { db.prepare("ALTER TABLE rates ADD COLUMN apply_vat INTEGER DEFAULT 0").run(); } catch (e) {}
-  try { db.prepare("ALTER TABLE norm_resources ADD COLUMN is_percentage INTEGER DEFAULT 0").run(); } catch (e) {}
-  try { db.prepare("ALTER TABLE norm_resources ADD COLUMN percentage_base TEXT").run(); } catch (e) {}
-  try { db.prepare("ALTER TABLE projects ADD COLUMN mode TEXT DEFAULT 'CONTRACTOR'").run(); } catch (e) {}
-
   // Health Check
-  app.get("/api/health", (req, res) => {
+  app.get("/api/health", async (req, res) => {
     try {
-      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
-      const normsCount = db.prepare("SELECT COUNT(*) as count FROM norms").get();
+      const tables = await pool.query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
+      );
+      const normsCount = await pool.query("SELECT COUNT(*) as count FROM norms");
       res.json({ 
         status: "ok", 
-        tables,
-        normsCount: normsCount.count
+        tables: tables.rows.map(r => ({ name: r.table_name })),
+        normsCount: parseInt(normsCount.rows[0].count)
       });
     } catch (e: any) {
       res.status(500).json({ status: "error", message: e.message });
@@ -171,145 +130,269 @@ async function startServer() {
   });
 
   // Norms
-  app.get("/api/norms", (req, res) => {
+  app.get("/api/norms", async (req, res) => {
     try {
-      const norms = db.prepare("SELECT * FROM norms").all();
-      const result = norms.map((norm: any) => {
-        const resources = db.prepare("SELECT * FROM norm_resources WHERE norm_id = ?").all(norm.id);
-        return { ...norm, resources };
-      });
+      const norms = await pool.query("SELECT * FROM norms ORDER BY id");
+      const result = [];
+      
+      for (const norm of norms.rows) {
+        const resources = await pool.query(
+          "SELECT * FROM norm_resources WHERE norm_id = $1 ORDER BY id",
+          [norm.id]
+        );
+        result.push({ ...norm, resources: resources.rows });
+      }
+      
       res.json(result);
     } catch (e: any) {
+      console.error("Error in GET /api/norms:", e);
       res.status(500).json({ error: e.message });
     }
   });
 
-  app.post("/api/norms", (req, res) => {
-    const { type, description, unit, basis_quantity, ref_ss, resources } = req.body;
-    const insertNorm = db.prepare("INSERT INTO norms (type, description, unit, basis_quantity, ref_ss) VALUES (?, ?, ?, ?, ?)");
-    const info = insertNorm.run(type, description, unit, basis_quantity || 1.0, ref_ss);
-    const normId = info.lastInsertRowid;
-
-    const insertResource = db.prepare("INSERT INTO norm_resources (norm_id, resource_type, name, unit, quantity, is_percentage, percentage_base) VALUES (?, ?, ?, ?, ?, ?, ?)");
-    const checkRate = db.prepare("SELECT * FROM rates WHERE name = ?");
-    const insertRate = db.prepare("INSERT INTO rates (resource_type, name, unit, rate) VALUES (?, ?, ?, ?)");
-    const updateRateMeta = db.prepare("UPDATE rates SET resource_type = ?, unit = ? WHERE name = ?");
-
-    for (const resource of resources) {
-      insertResource.run(normId, resource.resource_type, resource.name, resource.unit, resource.quantity, resource.is_percentage ? 1 : 0, resource.percentage_base || null);
+  app.post("/api/norms", async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
       
-      const existingRate = checkRate.get(resource.name);
-      if (!existingRate) {
-        insertRate.run(resource.resource_type, resource.name, resource.unit || '-', 0);
-      } else {
-        updateRateMeta.run(resource.resource_type, resource.unit || existingRate.unit, resource.name);
+      const { type, description, unit, basis_quantity, ref_ss, resources } = req.body;
+      
+      const normResult = await client.query(
+        "INSERT INTO norms (type, description, unit, basis_quantity, ref_ss) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        [type, description, unit, basis_quantity || 1.0, ref_ss]
+      );
+      const normId = normResult.rows[0].id;
+      
+      for (const resource of resources) {
+        await client.query(
+          `INSERT INTO norm_resources 
+           (norm_id, resource_type, name, unit, quantity, is_percentage, percentage_base) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            normId, 
+            resource.resource_type, 
+            resource.name, 
+            resource.unit, 
+            resource.quantity, 
+            resource.is_percentage ? 1 : 0, 
+            resource.percentage_base || null
+          ]
+        );
+        
+        // Sync to rates
+        const existingRate = await client.query(
+          "SELECT * FROM rates WHERE name = $1",
+          [resource.name]
+        );
+        
+        if (existingRate.rows.length === 0) {
+          await client.query(
+            "INSERT INTO rates (resource_type, name, unit, rate) VALUES ($1, $2, $3, $4)",
+            [resource.resource_type, resource.name, resource.unit || '-', 0]
+          );
+        } else {
+          await client.query(
+            "UPDATE rates SET resource_type = $1, unit = $2 WHERE name = $3",
+            [resource.resource_type, resource.unit || existingRate.rows[0].unit, resource.name]
+          );
+        }
       }
+      
+      await client.query('COMMIT');
+      res.json({ id: normId });
+    } catch (e: any) {
+      await client.query('ROLLBACK');
+      res.status(500).json({ error: e.message });
+    } finally {
+      client.release();
     }
-    res.json({ id: normId });
   });
 
-  app.put("/api/norms/:id", (req, res) => {
-    const { id } = req.params;
-    const { type, description, unit, basis_quantity, ref_ss, resources } = req.body;
-    db.prepare("UPDATE norms SET type = ?, description = ?, unit = ?, basis_quantity = ?, ref_ss = ? WHERE id = ?").run(type, description, unit, basis_quantity || 1.0, ref_ss, id);
-    db.prepare("DELETE FROM norm_resources WHERE norm_id = ?").run(id);
-    
-    const insertResource = db.prepare("INSERT INTO norm_resources (norm_id, resource_type, name, unit, quantity, is_percentage, percentage_base) VALUES (?, ?, ?, ?, ?, ?, ?)");
-    const checkRate = db.prepare("SELECT * FROM rates WHERE name = ?");
-    const insertRate = db.prepare("INSERT INTO rates (resource_type, name, unit, rate) VALUES (?, ?, ?, ?)");
-    const updateRateMeta = db.prepare("UPDATE rates SET resource_type = ?, unit = ? WHERE name = ?");
-
-    for (const resource of resources) {
-      insertResource.run(id, resource.resource_type, resource.name, resource.unit, resource.quantity, resource.is_percentage ? 1 : 0, resource.percentage_base || null);
+  app.put("/api/norms/:id", async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
       
-      const existingRate = checkRate.get(resource.name);
-      if (!existingRate) {
-        insertRate.run(resource.resource_type, resource.name, resource.unit || '-', 0);
-      } else {
-        updateRateMeta.run(resource.resource_type, resource.unit || existingRate.unit, resource.name);
+      const { id } = req.params;
+      const { type, description, unit, basis_quantity, ref_ss, resources } = req.body;
+      
+      await client.query(
+        "UPDATE norms SET type = $1, description = $2, unit = $3, basis_quantity = $4, ref_ss = $5 WHERE id = $6",
+        [type, description, unit, basis_quantity || 1.0, ref_ss, id]
+      );
+      
+      await client.query("DELETE FROM norm_resources WHERE norm_id = $1", [id]);
+      
+      for (const resource of resources) {
+        await client.query(
+          `INSERT INTO norm_resources 
+           (norm_id, resource_type, name, unit, quantity, is_percentage, percentage_base) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            id, 
+            resource.resource_type, 
+            resource.name, 
+            resource.unit, 
+            resource.quantity, 
+            resource.is_percentage ? 1 : 0, 
+            resource.percentage_base || null
+          ]
+        );
+        
+        const existingRate = await client.query(
+          "SELECT * FROM rates WHERE name = $1",
+          [resource.name]
+        );
+        
+        if (existingRate.rows.length === 0) {
+          await client.query(
+            "INSERT INTO rates (resource_type, name, unit, rate) VALUES ($1, $2, $3, $4)",
+            [resource.resource_type, resource.name, resource.unit || '-', 0]
+          );
+        } else {
+          await client.query(
+            "UPDATE rates SET resource_type = $1, unit = $2 WHERE name = $3",
+            [resource.resource_type, resource.unit || existingRate.rows[0].unit, resource.name]
+          );
+        }
       }
+      
+      await client.query('COMMIT');
+      res.json({ success: true });
+    } catch (e: any) {
+      await client.query('ROLLBACK');
+      res.status(500).json({ error: e.message });
+    } finally {
+      client.release();
     }
-    res.json({ success: true });
   });
 
-  app.delete("/api/norms/:id", (req, res) => {
-    db.prepare("DELETE FROM norms WHERE id = ?").run(req.params.id);
-    db.prepare("DELETE FROM norm_resources WHERE norm_id = ?").run(req.params.id);
-    res.json({ success: true });
+  app.delete("/api/norms/:id", async (req, res) => {
+    try {
+      await pool.query("DELETE FROM norms WHERE id = $1", [req.params.id]);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   // Rates
-  app.get("/api/rates", (req, res) => {
+  app.get("/api/rates", async (req, res) => {
     try {
-      res.json(db.prepare("SELECT * FROM rates").all());
+      const result = await pool.query("SELECT * FROM rates ORDER BY name");
+      res.json(result.rows);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
   });
 
-  app.post("/api/rates", (req, res) => {
+  app.post("/api/rates", async (req, res) => {
     const { resource_type, name, unit, rate, apply_vat } = req.body;
     try {
-      const info = db.prepare("INSERT INTO rates (resource_type, name, unit, rate, apply_vat) VALUES (?, ?, ?, ?, ?)").run(resource_type, name, unit, rate, apply_vat ? 1 : 0);
-      res.json({ id: info.lastInsertRowid });
+      const result = await pool.query(
+        "INSERT INTO rates (resource_type, name, unit, rate, apply_vat) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        [resource_type, name, unit, rate, apply_vat ? 1 : 0]
+      );
+      res.json({ id: result.rows[0].id });
     } catch (e) {
       res.status(400).json({ error: "Resource name already exists" });
     }
   });
 
-  app.put("/api/rates/:id", (req, res) => {
+  app.put("/api/rates/:id", async (req, res) => {
     const { resource_type, name, unit, rate, apply_vat } = req.body;
-    db.prepare("UPDATE rates SET resource_type = ?, name = ?, unit = ?, rate = ?, apply_vat = ? WHERE id = ?").run(resource_type, name, unit, rate, apply_vat ? 1 : 0, req.params.id);
-    res.json({ success: true });
-  });
-
-  app.delete("/api/rates/:id", (req, res) => {
-    db.prepare("DELETE FROM rates WHERE id = ?").run(req.params.id);
-    res.json({ success: true });
-  });
-
-  // Projects
-  app.get("/api/projects", (req, res) => {
     try {
-      res.json(db.prepare("SELECT * FROM projects ORDER BY created_at DESC").all());
+      await pool.query(
+        "UPDATE rates SET resource_type = $1, name = $2, unit = $3, rate = $4, apply_vat = $5 WHERE id = $6",
+        [resource_type, name, unit, rate, apply_vat ? 1 : 0, req.params.id]
+      );
+      res.json({ success: true });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
   });
 
-  app.get("/api/projects/:id", (req, res) => {
-    const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(req.params.id);
-    if (!project) return res.status(404).json({ error: "Project not found" });
-    const items = db.prepare(`
-      SELECT b.*, n.description, n.unit, n.basis_quantity, n.ref_ss 
-      FROM boq_items b 
-      JOIN norms n ON b.norm_id = n.id 
-      WHERE b.project_id = ?
-    `).all(req.params.id);
-    
-    const itemsWithResources = items.map((item: any) => {
-      const resources = db.prepare("SELECT * FROM norm_resources WHERE norm_id = ?").all(item.norm_id);
-      return { ...item, resources };
-    });
-
-    res.json({ ...project, items: itemsWithResources });
+  app.delete("/api/rates/:id", async (req, res) => {
+    try {
+      await pool.query("DELETE FROM rates WHERE id = $1", [req.params.id]);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
-  app.post("/api/projects", (req, res) => {
+  // Projects
+  app.get("/api/projects", async (req, res) => {
+    try {
+      const result = await pool.query("SELECT * FROM projects ORDER BY created_at DESC");
+      res.json(result.rows);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/projects/:id", async (req, res) => {
+    try {
+      const project = await pool.query("SELECT * FROM projects WHERE id = $1", [req.params.id]);
+      if (project.rows.length === 0) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+      
+      const items = await pool.query(`
+        SELECT b.*, n.description, n.unit, n.basis_quantity, n.ref_ss 
+        FROM boq_items b 
+        JOIN norms n ON b.norm_id = n.id 
+        WHERE b.project_id = $1
+      `, [req.params.id]);
+      
+      const itemsWithResources = [];
+      for (const item of items.rows) {
+        const resources = await pool.query(
+          "SELECT * FROM norm_resources WHERE norm_id = $1",
+          [item.norm_id]
+        );
+        itemsWithResources.push({ ...item, resources: resources.rows });
+      }
+      
+      res.json({ ...project.rows[0], items: itemsWithResources });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/projects", async (req, res) => {
     const { name, description, mode } = req.body;
-    const info = db.prepare("INSERT INTO projects (name, description, mode) VALUES (?, ?, ?)").run(name, description, mode || 'CONTRACTOR');
-    res.json({ id: info.lastInsertRowid });
+    try {
+      const result = await pool.query(
+        "INSERT INTO projects (name, description, mode) VALUES ($1, $2, $3) RETURNING id",
+        [name, description, mode || 'CONTRACTOR']
+      );
+      res.json({ id: result.rows[0].id });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
-  app.post("/api/projects/:id/items", (req, res) => {
+  app.post("/api/projects/:id/items", async (req, res) => {
     const { norm_id, quantity } = req.body;
-    const info = db.prepare("INSERT INTO boq_items (project_id, norm_id, quantity) VALUES (?, ?, ?)").run(req.params.id, norm_id, quantity);
-    res.json({ id: info.lastInsertRowid });
+    try {
+      const result = await pool.query(
+        "INSERT INTO boq_items (project_id, norm_id, quantity) VALUES ($1, $2, $3) RETURNING id",
+        [req.params.id, norm_id, quantity]
+      );
+      res.json({ id: result.rows[0].id });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
-  app.delete("/api/boq-items/:id", (req, res) => {
-    db.prepare("DELETE FROM boq_items WHERE id = ?").run(req.params.id);
-    res.json({ success: true });
+  app.delete("/api/boq-items/:id", async (req, res) => {
+    try {
+      await pool.query("DELETE FROM boq_items WHERE id = $1", [req.params.id]);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   // Vite middleware
@@ -354,12 +437,10 @@ async function startServer() {
     }
   }
 
-  // 404 for API
   app.use("/api/*", (req, res) => {
     res.status(404).json({ error: `API endpoint not found: ${req.originalUrl}` });
   });
 
-  // Global Error Handler
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
     console.error(err);
     res.status(500).json({ error: err.message || "Internal Server Error" });
@@ -367,8 +448,6 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server running on port ${PORT}`);
-    const count = db.prepare("SELECT COUNT(*) as count FROM norms").get();
-    console.log(`📊 Database has ${count.count} norms`);
   });
 }
 
