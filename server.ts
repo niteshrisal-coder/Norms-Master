@@ -1,40 +1,34 @@
 import express from "express";
-import path from "path";
-import { fileURLToPath } from 'url';
-import fs from "fs";
+import dotenv from "dotenv";
+import pkg from "pg";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+dotenv.config();
 
-console.log("🚀 Starting server in minimal mode...");
+const { Pool } = pkg;
 
-async function startServer() {
-  const app = express();
-  app.use(express.json());
-  
-  const PORT = process.env.PORT || 3000;
+const app = express();
+app.use(express.json());
 
-  // Simple health check
-  app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", message: "Server is running" });
-  });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
 
-  // Serve frontend if available
-  const distPath = path.join(__dirname, "dist");
-  if (fs.existsSync(distPath)) {
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  } else {
-    app.get("*", (req, res) => {
-      res.send("App is running - frontend building...");
-    });
+// Test route
+app.get("/test-db", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT NOW()");
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Database connection failed" });
   }
+});
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`✅ Server running on port ${PORT}`);
-  });
-}
+const PORT = process.env.PORT || 3000;
 
-startServer();
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
