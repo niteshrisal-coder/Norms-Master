@@ -90,6 +90,12 @@ interface ResourceRow {
   percentageBase?: string;
 }
 
+// Updated BOQ item type with two quantities
+interface BOQItemWithQuantities extends BOQItem {
+  estimate_quantity: number;
+  measurement_quantity: number;
+}
+
 export default function ProjectBOQ({ projectId, onBack }: { projectId: number, onBack: () => void }) {
   console.log('🔄 ProjectBOQ rendering, projectId:', projectId);
   
@@ -99,7 +105,9 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
   const [overrides, setOverrides] = useState<RateOverride[]>([]);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [viewMode, setViewMode] = useState<'BOQ' | 'RESOURCES' | 'ANALYSIS' | 'TRANSPORT'>('BOQ');
-  const [newItem, setNewItem] = useState({ norm_id: 0, quantity: 0 });
+  // NEW: Active quantity type tab
+  const [activeQuantityType, setActiveQuantityType] = useState<'ESTIMATE' | 'MEASUREMENT'>('ESTIMATE');
+  const [newItem, setNewItem] = useState({ norm_id: 0, estimate_quantity: 0, measurement_quantity: 0 });
   const [selectedAnalysisItem, setSelectedAnalysisItem] = useState<number | null>(null);
   
   // Transportation states
@@ -115,9 +123,12 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
   const [searchTerm, setSearchTerm] = useState('');
   const [showSearchResults, setShowSearchResults] = useState(false);
   
-  // Edit states for BOQ items
+  // Edit states for BOQ items (only used in Estimate tab)
   const [editingItemId, setEditingItemId] = useState<number | null>(null);
-  const [editForm, setEditForm] = useState({ quantity: 0, norm_id: 0 });
+  const [editForm, setEditForm] = useState({ estimate_quantity: 0 });
+
+  // Store calculated rates for each item to ensure dynamic updates
+  const [itemRates, setItemRates] = useState<Record<number, number>>({});
 
   // Initial data fetch
   useEffect(() => {
@@ -139,12 +150,31 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     });
   }, [projectId]);
 
+  // Update item rates whenever dependencies change
+  useEffect(() => {
+    if (project?.items) {
+      const rates: Record<number, number> = {};
+      project.items.forEach(item => {
+        rates[item.id] = calculateItemRate(item.norm_id);
+      });
+      setItemRates(rates);
+    }
+  }, [project, norms, rates, overrides, transportMaterials]);
+
   const fetchProject = async () => {
     console.log('📡 Fetching project:', projectId);
     const res = await fetch(`/api/projects/${projectId}`);
     if (!res.ok) throw new Error('Failed to fetch project');
     const data = await res.json();
     console.log('✅ Project loaded:', data.name);
+    
+    // Ensure items have both quantities (for backward compatibility)
+    data.items = data.items.map((item: any) => ({
+      ...item,
+      estimate_quantity: item.estimate_quantity || item.quantity || 0,
+      measurement_quantity: item.measurement_quantity || 0 // Start with 0, not copying from estimate
+    }));
+    
     setProject(data);
     if (data.items.length > 0 && !selectedAnalysisItem) {
       setSelectedAnalysisItem(data.items[0].id);
@@ -201,7 +231,13 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     return overrides.find(o => o.norm_id === normId && o.resource_name === resourceName);
   }, [overrides]);
 
-  // Calculate rate with project-specific overrides - memoized
+  // Get transport cost for a material
+  const getMaterialTransportCost = useCallback((materialName: string): number => {
+    const transportMaterial = transportMaterials.find(tm => tm.material_name === materialName);
+    return transportMaterial?.total_cost_per_unit || 0;
+  }, [transportMaterials]);
+
+  // Calculate rate with project-specific overrides AND transport costs
   const calculateItemRate = useCallback((normId: number, useOverrides: boolean = true) => {
     const norm = norms.find(n => n.id === normId);
     if (!norm || !project) return 0;
@@ -209,6 +245,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     let labourTotal = 0;
     let materialTotal = 0;
     let equipmentTotal = 0;
+    let transportTotal = 0;
     const percentageResources: any[] = [];
 
     norm.resources.forEach(res => {
@@ -230,20 +267,27 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
         }
         
         const amount = quantity * rate;
+        
+        // Add transport cost for materials
+        if (res.resource_type === 'Material') {
+          const transportCostPerUnit = getMaterialTransportCost(res.name);
+          transportTotal += quantity * transportCostPerUnit;
+        }
+        
         if (res.resource_type === 'Labour') labourTotal += amount;
         else if (res.resource_type === 'Material') materialTotal += amount;
         else if (res.resource_type === 'Equipment') equipmentTotal += amount;
       }
     });
 
-    const fixedTotal = labourTotal + materialTotal + equipmentTotal;
+    const fixedTotal = labourTotal + materialTotal + equipmentTotal + transportTotal;
     let percentageTotal = 0;
 
     percentageResources.forEach(res => {
       let base = 0;
       if (res.percentage_base === 'TOTAL') base = fixedTotal;
       else if (res.percentage_base === 'LABOUR') base = labourTotal;
-      else if (res.percentage_base === 'MATERIAL') base = materialTotal;
+      else if (res.percentage_base === 'MATERIAL') base = materialTotal + transportTotal; // Include transport in material base
       else if (res.percentage_base === 'EQUIPMENT') base = equipmentTotal;
       else {
         const baseRes = norm.resources.find(r => r.name === res.percentage_base && !r.is_percentage);
@@ -256,6 +300,11 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
             if (rateObj?.apply_vat) rate = rate * 1.13;
           }
           base = quantity * rate;
+          
+          // Add transport if base is material
+          if (baseRes.resource_type === 'Material') {
+            base += quantity * getMaterialTransportCost(baseRes.name);
+          }
         }
       }
       percentageTotal += (res.quantity / 100) * base;
@@ -268,27 +317,23 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       return rawRate * 1.15; // 15% CP&O
     }
     return rawRate;
-  }, [norms, project, rates, getOverride]);
+  }, [norms, project, rates, getOverride, getMaterialTransportCost]);
 
+  // Calculate total BOQ based on active quantity type
   const calculateTotalBOQ = useCallback(() => {
     if (!project) return 0;
     
-    // For USERS mode: BOQ total should equal total resource amount with VAT
-    if (project.mode === 'USERS') {
-      const resources = getResourceBreakdown();
-      return resources.reduce((acc, r) => acc + r.totalAmount, 0);
-    }
-    
-    // For CONTRACTOR mode: BOQ total = resource total + 15% overhead
-    const resources = getResourceBreakdown();
-    const resourceTotal = resources.reduce((acc, r) => acc + r.totalAmount, 0);
-    return resourceTotal * 1.15;
-  }, [project]);
+    return project.items.reduce((total, item) => {
+      const rate = itemRates[item.id] || calculateItemRate(item.norm_id);
+      const quantity = activeQuantityType === 'ESTIMATE' ? item.estimate_quantity : item.measurement_quantity;
+      return total + (rate * quantity);
+    }, 0);
+  }, [project, itemRates, calculateItemRate, activeQuantityType]);
 
-  // Memoized resource breakdown with transport costs
+  // Memoized resource breakdown with transport costs (based on active quantity type)
   const resourceBreakdown = useMemo((): ResourceRow[] => {
     if (!project) return [];
-    console.log('🧮 Calculating resource breakdown with transport');
+    console.log('🧮 Calculating resource breakdown with transport for', activeQuantityType);
     
     const breakdown: Record<string, ResourceRow> = {};
     
@@ -297,6 +342,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       const norm = norms.find(n => n.id === item.norm_id);
       if (!norm) return;
       const basis = norm.basis_quantity || 1;
+      const itemQuantity = activeQuantityType === 'ESTIMATE' ? item.estimate_quantity : item.measurement_quantity;
       
       norm.resources.forEach(res => {
         if (!res.is_percentage) {
@@ -324,7 +370,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
             };
           }
           
-          breakdown[key].quantity += (quantity / basis) * item.quantity;
+          breakdown[key].quantity += (quantity / basis) * itemQuantity;
         }
       });
     });
@@ -336,10 +382,8 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       
       // Add transport cost for materials
       if (item.type === 'Material') {
-        const transportMaterial = transportMaterials.find(tm => tm.material_name === item.name);
-        if (transportMaterial) {
-          item.transportCost = transportMaterial.total_cost_per_unit * item.quantity;
-        }
+        const transportCostPerUnit = getMaterialTransportCost(item.name);
+        item.transportCost = transportCostPerUnit * item.quantity;
       }
       
       item.totalAmount = item.amount + item.vatAmount + item.transportCost;
@@ -350,9 +394,10 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       const norm = norms.find(n => n.id === item.norm_id);
       if (!norm) return;
       const basis = norm.basis_quantity || 1;
+      const itemQuantity = activeQuantityType === 'ESTIMATE' ? item.estimate_quantity : item.measurement_quantity;
       
       // Calculate totals for this norm to use for percentage bases
-      let labourTotal = 0, materialTotal = 0, equipmentTotal = 0;
+      let labourTotal = 0, materialTotal = 0, equipmentTotal = 0, transportTotal = 0;
       
       norm.resources.forEach(res => {
         if (!res.is_percentage) {
@@ -363,14 +408,21 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
           
           if (project.mode === 'USERS' && rateObj?.apply_vat) rate = rate * 1.13;
           
-          const amount = (quantity / basis) * item.quantity * rate;
+          const amount = (quantity / basis) * itemQuantity * rate;
+          
+          // Add transport for materials
+          if (res.resource_type === 'Material') {
+            const transportCostPerUnit = getMaterialTransportCost(res.name);
+            transportTotal += (quantity / basis) * itemQuantity * transportCostPerUnit;
+          }
+          
           if (res.resource_type === 'Labour') labourTotal += amount;
           else if (res.resource_type === 'Material') materialTotal += amount;
           else if (res.resource_type === 'Equipment') equipmentTotal += amount;
         }
       });
       
-      const fixedTotal = labourTotal + materialTotal + equipmentTotal;
+      const fixedTotal = labourTotal + materialTotal + equipmentTotal + transportTotal;
       
       // Now process percentage resources
       norm.resources.forEach(res => {
@@ -380,7 +432,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
           
           if (res.percentage_base === 'TOTAL') base = fixedTotal;
           else if (res.percentage_base === 'LABOUR') base = labourTotal;
-          else if (res.percentage_base === 'MATERIAL') base = materialTotal;
+          else if (res.percentage_base === 'MATERIAL') base = materialTotal + transportTotal;
           else if (res.percentage_base === 'EQUIPMENT') base = equipmentTotal;
           else {
             // Find the base resource
@@ -393,7 +445,13 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
                 const rateObj = rates.find(r => r.name.toLowerCase() === baseRes.name.toLowerCase());
                 if (rateObj?.apply_vat) rate = rate * 1.13;
               }
-              base = (quantity / basis) * item.quantity * rate;
+              base = (quantity / basis) * itemQuantity * rate;
+              
+              // Add transport if base is material
+              if (baseRes.resource_type === 'Material') {
+                const transportCostPerUnit = getMaterialTransportCost(baseRes.name);
+                base += (quantity / basis) * itemQuantity * transportCostPerUnit;
+              }
             }
           }
           
@@ -423,16 +481,16 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       if (a.type !== 'Percentage' && b.type === 'Percentage') return -1;
       return a.type.localeCompare(b.type);
     });
-  }, [project, norms, rates, getOverride, transportMaterials]);
+  }, [project, norms, rates, getOverride, getMaterialTransportCost, activeQuantityType]);
 
   const getResourceBreakdown = useCallback(() => {
     return resourceBreakdown;
   }, [resourceBreakdown]);
 
-  // Get all materials with their quantities for transportation - memoized
+  // Get all materials with their quantities for transportation - based on active quantity type
   const getMaterialsForTransport = useCallback((): TransportMaterialRow[] => {
     if (!project || !transportSettings) return [];
-    console.log('🧮 Calculating materials for transport');
+    console.log('🧮 Calculating materials for transport based on', activeQuantityType);
     
     const resourceBreakdown = getResourceBreakdown();
     const materialRows = resourceBreakdown.filter(r => r.type === 'Material');
@@ -467,7 +525,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     
     // Calculate transportation costs per unit
     return calculateTransportCostsPerUnit(materials);
-  }, [project, transportSettings, getResourceBreakdown, materialTransport]);
+  }, [project, transportSettings, getResourceBreakdown, materialTransport, activeQuantityType]);
 
   const calculateTransportCostsPerUnit = useCallback((materials: TransportMaterialRow[]): TransportMaterialRow[] => {
     if (!transportSettings) return materials;
@@ -555,14 +613,14 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     });
   }, [transportSettings]);
 
-  // Update transport materials when dependencies change - but only when in TRANSPORT mode
+  // Update transport materials when dependencies change
   useEffect(() => {
     if (viewMode === 'TRANSPORT' && transportSettings && project) {
       console.log('🔄 Updating transport materials');
       const materials = getMaterialsForTransport();
       setTransportMaterials(materials);
     }
-  }, [viewMode, transportSettings, materialTransport, project, getMaterialsForTransport]);
+  }, [viewMode, transportSettings, materialTransport, project, getMaterialsForTransport, activeQuantityType]);
 
   // Save material transport data
   const saveMaterialTransport = async () => {
@@ -644,14 +702,18 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
   }, [norms, searchTerm]);
 
   const handleAddItem = async () => {
-    if (!newItem.norm_id || newItem.quantity <= 0) return;
+    if (!newItem.norm_id || (newItem.estimate_quantity <= 0 && newItem.measurement_quantity <= 0)) return;
     console.log('➕ Adding BOQ item');
     await fetch(`/api/projects/${projectId}/items`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newItem)
+      body: JSON.stringify({
+        norm_id: newItem.norm_id,
+        estimate_quantity: newItem.estimate_quantity,
+        measurement_quantity: 0 // Always start measurement quantity at 0
+      })
     });
-    setNewItem({ norm_id: 0, quantity: 0 });
+    setNewItem({ norm_id: 0, estimate_quantity: 0, measurement_quantity: 0 });
     setSearchTerm('');
     setShowSearchResults(false);
     setIsAddModalOpen(false);
@@ -666,19 +728,24 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     }
   };
 
-  // Start editing an item
+  // Start editing an item (Estimate tab only)
   const handleEditItem = (item: any) => {
     setEditingItemId(item.id);
-    setEditForm({ quantity: item.quantity, norm_id: item.norm_id });
+    setEditForm({ 
+      estimate_quantity: item.estimate_quantity
+    });
   };
 
-  // Save edited item
+  // Save edited item (Estimate tab only)
   const handleSaveEdit = async (id: number) => {
     console.log('💾 Saving BOQ item edit:', id);
     await fetch(`/api/boq-items/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ quantity: editForm.quantity })
+      body: JSON.stringify({ 
+        estimate_quantity: editForm.estimate_quantity
+        // measurement_quantity unchanged
+      })
     });
     setEditingItemId(null);
     fetchProject();
@@ -687,6 +754,37 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
   // Cancel edit
   const handleCancelEdit = () => {
     setEditingItemId(null);
+  };
+
+  // Handle measurement quantity change (direct input, no save button)
+  const handleMeasurementQuantityChange = async (itemId: number, value: number) => {
+    // Optimistically update UI
+    setProject(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        items: prev.items.map(item => 
+          item.id === itemId 
+            ? { ...item, measurement_quantity: value }
+            : item
+        )
+      };
+    });
+
+    // Save to database
+    try {
+      await fetch(`/api/boq-items/${itemId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          measurement_quantity: value
+          // estimate_quantity unchanged
+        })
+      });
+    } catch (error) {
+      console.error('Error saving measurement quantity:', error);
+      // Revert on error? Could add error handling
+    }
   };
 
   // Save rate override
@@ -707,10 +805,10 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     return Math.trunc(num * 100) / 100;
   };
 
-  // Export BOQ
+  // Export BOQ with formulas (based on active quantity type)
   const exportBOQ = async () => {
     if (!project) return;
-    console.log('📤 Exporting BOQ');
+    console.log('📤 Exporting BOQ with formulas -', activeQuantityType);
     
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet('BOQ');
@@ -718,7 +816,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     // Add title
     sheet.mergeCells('A1:G1');
     const titleRow = sheet.getCell('A1');
-    titleRow.value = `Bill of Quantities - ${project.name} (${project.mode} Mode)`;
+    titleRow.value = `Bill of Quantities - ${project.name} (${project.mode} Mode) - ${activeQuantityType === 'ESTIMATE' ? 'As per Estimate' : 'As per Measurement'}`;
     titleRow.font = { size: 16, bold: true };
     titleRow.alignment = { horizontal: 'center', vertical: 'middle' };
     titleRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF5F5F5' } };
@@ -726,8 +824,8 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     
     sheet.addRow([]);
 
-    // Set column widths
-    sheet.columns = [
+    // Set column headers (removed Quantity Type column)
+    const headers = [
       { header: 'S.N.', key: 'sn', width: 8 },
       { header: 'Description of Work Item', key: 'desc', width: 50 },
       { header: 'Unit', key: 'unit', width: 10 },
@@ -736,6 +834,8 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       { header: 'Total Amount (Rs.)', key: 'total', width: 20 },
       { header: 'Ref to SS', key: 'ref', width: 15 }
     ];
+
+    sheet.columns = headers.map(h => ({ header: h.header, key: h.key, width: h.width }));
 
     // Style headers
     const headerRow = sheet.getRow(3);
@@ -750,17 +850,17 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     // Add data
     let rowIndex = 4;
     project.items.forEach((item, idx) => {
-      const rate = formatNumber(calculateItemRate(item.norm_id));
-      const total = formatNumber(rate * item.quantity);
+      const rate = itemRates[item.id] || calculateItemRate(item.norm_id);
+      const quantity = activeQuantityType === 'ESTIMATE' ? item.estimate_quantity : item.measurement_quantity;
       const row = sheet.getRow(rowIndex);
       row.height = 25;
       
       row.getCell(1).value = idx + 1;
       row.getCell(2).value = item.description;
       row.getCell(3).value = item.unit;
-      row.getCell(4).value = item.quantity;
+      row.getCell(4).value = quantity;
       row.getCell(5).value = rate;
-      row.getCell(6).value = total;
+      row.getCell(6).value = { formula: `E${rowIndex}*D${rowIndex}` }; // Excel formula for total
       row.getCell(7).value = item.ref_ss || '-';
       
       // Apply borders and formatting
@@ -794,7 +894,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     totalRow.getCell(5).value = 'TOTAL:';
     totalRow.getCell(5).font = { bold: true };
     totalRow.getCell(5).alignment = { horizontal: 'right', vertical: 'middle' };
-    totalRow.getCell(6).value = formatNumber(calculateTotalBOQ());
+    totalRow.getCell(6).value = { formula: `SUM(F4:F${rowIndex - 1})` }; // Sum formula
     totalRow.getCell(6).font = { bold: true };
     totalRow.getCell(6).numFmt = '#,##0.00';
     totalRow.getCell(6).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F5E9' } };
@@ -804,13 +904,13 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     }
 
     const buffer = await workbook.xlsx.writeBuffer();
-    saveAs(new Blob([buffer]), `${project.name}_BOQ.xlsx`);
+    saveAs(new Blob([buffer]), `${project.name}_BOQ_${activeQuantityType === 'ESTIMATE' ? 'Estimate' : 'Measurement'}.xlsx`);
   };
 
-  // Export Resource Breakdown with VAT and Transport
+  // Export Resource Breakdown (based on active quantity type)
   const exportResources = async () => {
     if (!project) return;
-    console.log('📤 Exporting Resources');
+    console.log('📤 Exporting Resources with formulas -', activeQuantityType);
     
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet('Resource Breakdown');
@@ -818,7 +918,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     // Add title
     sheet.mergeCells('A1:I1');
     const titleRow = sheet.getCell('A1');
-    titleRow.value = `Resource Breakdown - ${project.name} (${project.mode} Mode)`;
+    titleRow.value = `Resource Breakdown - ${project.name} (${project.mode} Mode) - ${activeQuantityType === 'ESTIMATE' ? 'As per Estimate' : 'As per Measurement'}`;
     titleRow.font = { size: 16, bold: true };
     titleRow.alignment = { horizontal: 'center', vertical: 'middle' };
     titleRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF5F5F5' } };
@@ -826,8 +926,8 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     
     sheet.addRow([]);
 
-    // Set column widths
-    sheet.columns = [
+    // Set column headers
+    const headers = [
       { header: 'Type', key: 'type', width: 15 },
       { header: 'Resource Name', key: 'name', width: 40 },
       { header: 'Unit', key: 'unit', width: 10 },
@@ -838,6 +938,8 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       { header: 'Transport (Rs.)', key: 'transport', width: 18 },
       { header: 'Total Amount (Rs.)', key: 'totalAmount', width: 20 }
     ];
+
+    sheet.columns = headers.map(h => ({ header: h.header, key: h.key, width: h.width }));
 
     // Style headers
     const headerRow = sheet.getRow(3);
@@ -859,12 +961,12 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       row.getCell(1).value = res.type;
       row.getCell(2).value = res.name;
       row.getCell(3).value = res.unit;
-      row.getCell(4).value = formatNumber(res.quantity);
-      row.getCell(5).value = formatNumber(res.rate);
-      row.getCell(6).value = formatNumber(res.amount);
-      row.getCell(7).value = formatNumber(res.vatAmount);
-      row.getCell(8).value = formatNumber(res.transportCost);
-      row.getCell(9).value = formatNumber(res.totalAmount);
+      row.getCell(4).value = res.quantity;
+      row.getCell(5).value = res.rate;
+      row.getCell(6).value = { formula: `D${rowIndex}*E${rowIndex}` }; // Amount = Quantity * Rate
+      row.getCell(7).value = { formula: `F${rowIndex}*0.13` }; // VAT = Amount * 13%
+      row.getCell(8).value = res.transportCost;
+      row.getCell(9).value = { formula: `F${rowIndex}+G${rowIndex}+H${rowIndex}` }; // Total = Amount + VAT + Transport
       
       // Apply borders to all cells in row
       for (let i = 1; i <= 9; i++) {
@@ -892,12 +994,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       rowIndex++;
     });
 
-    // Add total row
-    const totalAmount = resources.reduce((acc, r) => acc + r.amount, 0);
-    const totalVAT = resources.reduce((acc, r) => acc + r.vatAmount, 0);
-    const totalTransport = resources.reduce((acc, r) => acc + r.transportCost, 0);
-    const totalAll = resources.reduce((acc, r) => acc + r.totalAmount, 0);
-    
+    // Add total row with formulas
     sheet.addRow([]);
     const totalRow = sheet.getRow(rowIndex + 1);
     totalRow.height = 30;
@@ -906,19 +1003,19 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     totalRow.getCell(5).font = { bold: true };
     totalRow.getCell(5).alignment = { horizontal: 'right', vertical: 'middle' };
     
-    totalRow.getCell(6).value = formatNumber(totalAmount);
+    totalRow.getCell(6).value = { formula: `SUM(F4:F${rowIndex - 1})` };
     totalRow.getCell(6).font = { bold: true };
     totalRow.getCell(6).numFmt = '#,##0.00';
     
-    totalRow.getCell(7).value = formatNumber(totalVAT);
+    totalRow.getCell(7).value = { formula: `SUM(G4:G${rowIndex - 1})` };
     totalRow.getCell(7).font = { bold: true };
     totalRow.getCell(7).numFmt = '#,##0.00';
     
-    totalRow.getCell(8).value = formatNumber(totalTransport);
+    totalRow.getCell(8).value = { formula: `SUM(H4:H${rowIndex - 1})` };
     totalRow.getCell(8).font = { bold: true };
     totalRow.getCell(8).numFmt = '#,##0.00';
     
-    totalRow.getCell(9).value = formatNumber(totalAll);
+    totalRow.getCell(9).value = { formula: `SUM(I4:I${rowIndex - 1})` };
     totalRow.getCell(9).font = { bold: true };
     totalRow.getCell(9).numFmt = '#,##0.00';
     totalRow.getCell(9).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F5E9' } };
@@ -929,13 +1026,13 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     }
 
     const buffer = await workbook.xlsx.writeBuffer();
-    saveAs(new Blob([buffer]), `${project.name}_Resource_Breakdown.xlsx`);
+    saveAs(new Blob([buffer]), `${project.name}_Resource_Breakdown_${activeQuantityType === 'ESTIMATE' ? 'Estimate' : 'Measurement'}.xlsx`);
   };
 
   // Export Detailed Rate Analysis
   const exportRateAnalysis = async () => {
     if (!project || !norms.length) return;
-    console.log('📤 Exporting Rate Analysis');
+    console.log('📤 Exporting Rate Analysis with formulas');
     
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet('Rate Analysis');
@@ -982,7 +1079,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       currentRow++;
 
       // Calculate totals for percentages
-      let labourTotal = 0, materialTotal = 0, equipmentTotal = 0;
+      let labourTotal = 0, materialTotal = 0, equipmentTotal = 0, transportTotal = 0;
       
       norm.resources.forEach(res => {
         if (!res.is_percentage) {
@@ -994,13 +1091,20 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
           if (project.mode === 'USERS' && rateObj?.apply_vat) rate = rate * 1.13;
           
           const amount = quantity * rate;
+          
+          // Add transport for materials
+          if (res.resource_type === 'Material') {
+            const transportCostPerUnit = getMaterialTransportCost(res.name);
+            transportTotal += quantity * transportCostPerUnit;
+          }
+          
           if (res.resource_type === 'Labour') labourTotal += amount;
           else if (res.resource_type === 'Material') materialTotal += amount;
           else if (res.resource_type === 'Equipment') equipmentTotal += amount;
         }
       });
 
-      const fixedTotal = labourTotal + materialTotal + equipmentTotal;
+      const fixedTotal = labourTotal + materialTotal + equipmentTotal + transportTotal;
 
       // Add resources
       norm.resources.forEach(res => {
@@ -1018,7 +1122,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
           let base = 0;
           if (res.percentage_base === 'TOTAL') base = fixedTotal;
           else if (res.percentage_base === 'LABOUR') base = labourTotal;
-          else if (res.percentage_base === 'MATERIAL') base = materialTotal;
+          else if (res.percentage_base === 'MATERIAL') base = materialTotal + transportTotal;
           else if (res.percentage_base === 'EQUIPMENT') base = equipmentTotal;
           else {
             const baseRes = norm.resources.find(r => r.name === res.percentage_base && !r.is_percentage);
@@ -1029,6 +1133,11 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
               const baseQty = baseOverride?.override_quantity ?? baseRes.quantity;
               if (project.mode === 'USERS' && baseRateObj?.apply_vat) baseRate = baseRate * 1.13;
               base = baseQty * baseRate;
+              
+              // Add transport if base is material
+              if (baseRes.resource_type === 'Material') {
+                base += baseQty * getMaterialTransportCost(baseRes.name);
+              }
             }
           }
           amount = (res.quantity / 100) * base;
@@ -1039,7 +1148,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
           row.getCell(4).value = '-';
           row.getCell(5).value = '-';
           row.getCell(6).value = '-';
-          row.getCell(7).value = formatNumber(amount);
+          row.getCell(7).value = amount;
         } else {
           if (project.mode === 'USERS' && applyVat) rate = rate * 1.13;
           amount = quantity * rate;
@@ -1048,9 +1157,9 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
           row.getCell(2).value = res.name;
           row.getCell(3).value = res.unit || '-';
           row.getCell(4).value = quantity;
-          row.getCell(5).value = formatNumber(rate);
+          row.getCell(5).value = rate;
           row.getCell(6).value = applyVat ? '13%' : '-';
-          row.getCell(7).value = formatNumber(amount);
+          row.getCell(7).value = { formula: `D${currentRow}*E${currentRow}` }; // Amount = Quantity * Rate
         }
         
         // Apply borders and formatting
@@ -1077,8 +1186,29 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
         currentRow++;
       });
 
-      // Item unit rate (not subtotal)
-      const itemRate = formatNumber(calculateItemRate(item.norm_id));
+      // Add transport summary for this item
+      const transportMaterialsForItem = transportMaterials.filter(tm => 
+        norm.resources.some(r => r.resource_type === 'Material' && r.name === tm.material_name)
+      );
+      
+      if (transportMaterialsForItem.length > 0) {
+        const transportRow = sheet.getRow(currentRow);
+        transportRow.getCell(2).value = 'Transport Cost Included:';
+        transportRow.getCell(2).font = { bold: true, italic: true };
+        transportRow.getCell(2).alignment = { horizontal: 'left' };
+        currentRow++;
+        
+        transportMaterialsForItem.forEach(tm => {
+          const row = sheet.getRow(currentRow);
+          row.getCell(2).value = `  - ${tm.material_name}: Rs. ${tm.total_cost_per_unit.toFixed(2)} per unit`;
+          row.getCell(2).font = { italic: true };
+          row.getCell(2).alignment = { horizontal: 'left' };
+          currentRow++;
+        });
+      }
+
+      // Item unit rate
+      const itemRate = itemRates[item.id] || calculateItemRate(item.norm_id);
       
       sheet.addRow([]);
       const unitRateRow = sheet.getRow(currentRow + 1);
@@ -1094,14 +1224,14 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       currentRow += 3;
     }
 
-    // Grand total
+    // Grand total (using active quantity type)
     sheet.addRow([]);
     const grandTotalRow = sheet.getRow(currentRow + 2);
     grandTotalRow.height = 30;
     grandTotalRow.getCell(6).value = 'GRAND TOTAL:';
     grandTotalRow.getCell(6).font = { bold: true, size: 12 };
     grandTotalRow.getCell(6).alignment = { horizontal: 'right', vertical: 'middle' };
-    grandTotalRow.getCell(7).value = formatNumber(calculateTotalBOQ());
+    grandTotalRow.getCell(7).value = calculateTotalBOQ();
     grandTotalRow.getCell(7).font = { bold: true, size: 12 };
     grandTotalRow.getCell(7).numFmt = '#,##0.00';
     grandTotalRow.getCell(7).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F5E9' } };
@@ -1137,8 +1267,8 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
     sheet.addRow([`Porter Distance: ${transportSettings?.porter_distance} km`]);
     sheet.addRow([]);
 
-    // Set column widths
-    sheet.columns = [
+    // Set column headers
+    const headers = [
       { header: 'Material', key: 'material', width: 30 },
       { header: 'Unit Weight (kg)', key: 'unitWeight', width: 15 },
       { header: 'Category', key: 'category', width: 15 },
@@ -1147,6 +1277,8 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       { header: 'Porter (Rs./unit)', key: 'porter', width: 18 },
       { header: 'Total (Rs./unit)', key: 'total', width: 18 }
     ];
+
+    sheet.columns = headers.map(h => ({ header: h.header, key: h.key, width: h.width }));
 
     // Style headers
     const headerRow = sheet.getRow(7);
@@ -1167,10 +1299,10 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
       row.getCell(1).value = material.material_name;
       row.getCell(2).value = material.unit_weight;
       row.getCell(3).value = material.load_category;
-      row.getCell(4).value = formatNumber(material.metalled_cost_per_unit);
-      row.getCell(5).value = formatNumber(material.gravelled_cost_per_unit);
-      row.getCell(6).value = formatNumber(material.porter_cost_per_unit);
-      row.getCell(7).value = formatNumber(material.total_cost_per_unit);
+      row.getCell(4).value = material.metalled_cost_per_unit;
+      row.getCell(5).value = material.gravelled_cost_per_unit;
+      row.getCell(6).value = material.porter_cost_per_unit;
+      row.getCell(7).value = { formula: `D${rowIndex}+E${rowIndex}+F${rowIndex}` }; // Total = Sum of all costs
       
       for (let i = 1; i <= 7; i++) {
         const cell = row.getCell(i);
@@ -1256,7 +1388,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
               className="bg-white text-black px-6 py-3 rounded-2xl font-bold flex items-center gap-2 hover:bg-black/5 transition-all border border-black/5"
             >
               <FileText size={18} />
-              Export BOQ
+              Export BOQ ({activeQuantityType === 'ESTIMATE' ? 'Estimate' : 'Measurement'})
             </button>
           )}
           {viewMode === 'RESOURCES' && (
@@ -1265,7 +1397,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
               className="bg-white text-black px-6 py-3 rounded-2xl font-bold flex items-center gap-2 hover:bg-black/5 transition-all border border-black/5"
             >
               <PieChart size={18} />
-              Export Resources
+              Export Resources ({activeQuantityType === 'ESTIMATE' ? 'Estimate' : 'Measurement'})
             </button>
           )}
           {viewMode === 'ANALYSIS' && (
@@ -1286,24 +1418,57 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
               Export Transport
             </button>
           )}
+          {/* Only show Add Item button in Estimate tab */}
+          {activeQuantityType === 'ESTIMATE' && (
+            <button 
+              onClick={() => setIsAddModalOpen(true)}
+              className="bg-[#141414] text-white px-6 py-3 rounded-2xl font-bold flex items-center gap-2 hover:bg-black transition-all shadow-lg shadow-black/10"
+            >
+              <Plus size={20} />
+              Add Item
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Quantity Type Tabs */}
+      <div className="flex items-center justify-between">
+        <div className="bg-[#F5F5F0] p-1 rounded-2xl flex border border-black/5 shadow-sm">
           <button 
-            onClick={() => setIsAddModalOpen(true)}
-            className="bg-[#141414] text-white px-6 py-3 rounded-2xl font-bold flex items-center gap-2 hover:bg-black transition-all shadow-lg shadow-black/10"
+            onClick={() => setActiveQuantityType('ESTIMATE')}
+            className={`px-8 py-3 rounded-xl text-sm font-bold uppercase tracking-widest transition-all ${
+              activeQuantityType === 'ESTIMATE' 
+                ? 'bg-[#141414] text-white shadow-lg' 
+                : 'text-black/40 hover:text-black/60'
+            }`}
           >
-            <Plus size={20} />
-            Add Item
+            As per Estimate
+          </button>
+          <button 
+            onClick={() => setActiveQuantityType('MEASUREMENT')}
+            className={`px-8 py-3 rounded-xl text-sm font-bold uppercase tracking-widest transition-all ${
+              activeQuantityType === 'MEASUREMENT' 
+                ? 'bg-[#141414] text-white shadow-lg' 
+                : 'text-black/40 hover:text-black/60'
+            }`}
+          >
+            As per Measurement
           </button>
         </div>
       </div>
 
-      {/* Stats & Toggle */}
+      {/* Stats */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         <div className="bg-white p-6 rounded-3xl border border-black/5 shadow-sm">
-          <p className="text-[10px] font-bold uppercase tracking-widest text-black/40 mb-1">Total BOQ Amount</p>
+          <p className="text-[10px] font-bold uppercase tracking-widest text-black/40 mb-1">
+            Total BOQ Amount ({activeQuantityType === 'ESTIMATE' ? 'Estimate' : 'Measurement'})
+          </p>
           <p className="text-3xl font-bold tracking-tighter">Rs. {formatNumber(calculateTotalBOQ()).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
         </div>
         <div className="bg-white p-6 rounded-3xl border border-black/5 shadow-sm">
-          <p className="text-[10px] font-bold uppercase tracking-widest text-black/40 mb-1">Total Resource Cost</p>
+          <p className="text-[10px] font-bold uppercase tracking-widest text-black/40 mb-1">
+            Total Resource Cost ({activeQuantityType === 'ESTIMATE' ? 'Estimate' : 'Measurement'})
+          </p>
           <p className="text-3xl font-bold tracking-tighter">Rs. {formatNumber(totalResourcesAmount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
         </div>
         <div className="bg-[#F5F5F0] p-1 rounded-2xl flex border border-black/5 shadow-sm">
@@ -1354,14 +1519,18 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
                     <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-widest text-black/40 w-32">Rate</th>
                     <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-widest text-black/40 w-40">Total Amount</th>
                     <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-widest text-black/40 w-32">Ref to SS</th>
-                    <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-widest text-black/40 w-24">Actions</th>
+                    {/* Actions column only shown in Estimate tab */}
+                    {activeQuantityType === 'ESTIMATE' && (
+                      <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-widest text-black/40 w-24">Actions</th>
+                    )}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-black/5">
                   {project.items.map((item, idx) => {
-                    const rate = formatNumber(calculateItemRate(item.norm_id));
-                    const total = formatNumber(rate * item.quantity);
-                    const isEditing = editingItemId === item.id;
+                    const rate = itemRates[item.id] || calculateItemRate(item.norm_id);
+                    const quantity = activeQuantityType === 'ESTIMATE' ? item.estimate_quantity : item.measurement_quantity;
+                    const total = rate * quantity;
+                    const isEditing = editingItemId === item.id && activeQuantityType === 'ESTIMATE';
                     
                     return (
                       <tr key={item.id} className="hover:bg-black/5 transition-colors group">
@@ -1374,67 +1543,85 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
                         </td>
                         <td className="px-6 py-4 text-sm font-mono opacity-60">{item.unit}</td>
                         <td className="px-6 py-4">
-                          {isEditing ? (
+                          {activeQuantityType === 'ESTIMATE' ? (
+                            // Estimate tab: editable with save/cancel
+                            isEditing ? (
+                              <input
+                                type="number"
+                                value={editForm.estimate_quantity}
+                                onChange={(e) => setEditForm({ estimate_quantity: parseFloat(e.target.value) })}
+                                className="w-24 p-1 border border-black/10 rounded-lg text-sm"
+                                step="0.01"
+                                min="0"
+                              />
+                            ) : (
+                              <span className="text-sm font-bold">{quantity}</span>
+                            )
+                          ) : (
+                            // Measurement tab: directly editable input, no save button needed
                             <input
                               type="number"
-                              value={editForm.quantity}
-                              onChange={(e) => setEditForm({ ...editForm, quantity: parseFloat(e.target.value) })}
-                              className="w-24 p-1 border border-black/10 rounded-lg text-sm"
+                              value={quantity}
+                              onChange={(e) => handleMeasurementQuantityChange(item.id, parseFloat(e.target.value) || 0)}
+                              className="w-24 p-1 bg-blue-50 border border-blue-200 rounded-lg text-sm focus:ring-2 focus:ring-blue-500"
                               step="0.01"
                               min="0"
+                              placeholder="Enter quantity"
                             />
-                          ) : (
-                            <span className="text-sm font-bold">{item.quantity}</span>
                           )}
                         </td>
-                        <td className="px-6 py-4 text-sm font-mono">Rs. {rate.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-                        <td className="px-6 py-4 text-sm font-bold">Rs. {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                        <td className="px-6 py-4 text-sm font-mono">Rs. {formatNumber(rate).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                        <td className="px-6 py-4 text-sm font-bold">Rs. {formatNumber(total).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                         <td className="px-6 py-4 text-xs font-medium text-black/40">{item.ref_ss || '-'}</td>
-                        <td className="px-6 py-4 text-right">
-                          <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                            {isEditing ? (
-                              <>
-                                <button 
-                                  onClick={() => handleSaveEdit(item.id)}
-                                  className="p-2 text-emerald-600 hover:bg-emerald-50 rounded-xl transition-all"
-                                  title="Save"
-                                >
-                                  <Save size={16} />
-                                </button>
-                                <button 
-                                  onClick={handleCancelEdit}
-                                  className="p-2 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all"
-                                  title="Cancel"
-                                >
-                                  <XCircle size={16} />
-                                </button>
-                              </>
-                            ) : (
-                              <>
-                                <button 
-                                  onClick={() => handleEditItem(item)}
-                                  className="p-2 text-blue-400 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition-all"
-                                  title="Edit"
-                                >
-                                  <Edit2 size={16} />
-                                </button>
-                                <button 
-                                  onClick={() => handleDeleteItem(item.id)}
-                                  className="p-2 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all"
-                                  title="Delete"
-                                >
-                                  <Trash2 size={16} />
-                                </button>
-                              </>
-                            )}
-                          </div>
-                        </td>
+                        
+                        {/* Actions only in Estimate tab */}
+                        {activeQuantityType === 'ESTIMATE' && (
+                          <td className="px-6 py-4 text-right">
+                            <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                              {isEditing ? (
+                                <>
+                                  <button 
+                                    onClick={() => handleSaveEdit(item.id)}
+                                    className="p-2 text-emerald-600 hover:bg-emerald-50 rounded-xl transition-all"
+                                    title="Save"
+                                  >
+                                    <Save size={16} />
+                                  </button>
+                                  <button 
+                                    onClick={handleCancelEdit}
+                                    className="p-2 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all"
+                                    title="Cancel"
+                                  >
+                                    <XCircle size={16} />
+                                  </button>
+                                </>
+                              ) : (
+                                <>
+                                  <button 
+                                    onClick={() => handleEditItem(item)}
+                                    className="p-2 text-blue-400 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition-all"
+                                    title="Edit"
+                                  >
+                                    <Edit2 size={16} />
+                                  </button>
+                                  <button 
+                                    onClick={() => handleDeleteItem(item.id)}
+                                    className="p-2 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all"
+                                    title="Delete"
+                                  >
+                                    <Trash2 size={16} />
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </td>
+                        )}
                       </tr>
                     );
                   })}
                   {project.items.length === 0 && (
                     <tr>
-                      <td colSpan={8} className="px-6 py-24 text-center text-black/20 italic">
+                      <td colSpan={activeQuantityType === 'ESTIMATE' ? 8 : 7} className="px-6 py-24 text-center text-black/20 italic">
                         No items in BOQ. Click "Add Item" to begin.
                       </td>
                     </tr>
@@ -1443,8 +1630,12 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
                 {project.items.length > 0 && (
                   <tfoot>
                     <tr className="bg-[#F5F5F0] border-t border-black/10">
-                      <td colSpan={5} className="px-6 py-5 text-sm font-bold uppercase tracking-widest text-right text-black/60">Total BOQ Amount</td>
-                      <td colSpan={3} className="px-6 py-5 text-2xl font-bold tracking-tighter text-emerald-600">Rs. {formatNumber(calculateTotalBOQ()).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                      <td colSpan={activeQuantityType === 'ESTIMATE' ? 5 : 4} className="px-6 py-5 text-sm font-bold uppercase tracking-widest text-right text-black/60">
+                        Total BOQ Amount ({activeQuantityType === 'ESTIMATE' ? 'Estimate' : 'Measurement'})
+                      </td>
+                      <td colSpan={activeQuantityType === 'ESTIMATE' ? 3 : 3} className="px-6 py-5 text-2xl font-bold tracking-tighter text-emerald-600">
+                        Rs. {formatNumber(calculateTotalBOQ()).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
                     </tr>
                   </tfoot>
                 )}
@@ -1513,7 +1704,9 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
                 </tbody>
                 <tfoot>
                   <tr className="bg-[#F5F5F0] border-t border-black/10">
-                    <td colSpan={8} className="px-6 py-5 text-sm font-bold uppercase tracking-widest text-right text-black/60">Total Resource Amount (with VAT & Transport)</td>
+                    <td colSpan={8} className="px-6 py-5 text-sm font-bold uppercase tracking-widest text-right text-black/60">
+                      Total Resource Amount ({activeQuantityType === 'ESTIMATE' ? 'Estimate' : 'Measurement'})
+                    </td>
                     <td className="px-6 py-5 text-2xl font-bold tracking-tighter text-emerald-600">
                       Rs. {formatNumber(totalResourcesAmount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </td>
@@ -1523,7 +1716,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
               <div className="p-6 bg-emerald-50 border-t border-emerald-100 flex items-center gap-3">
                 <CheckCircle2 className="text-emerald-600" size={20} />
                 <p className="text-xs font-medium text-emerald-800">
-                  Verification: Resources total (Rs. {formatNumber(totalResourcesAmount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) matches BOQ total {project.mode === 'CONTRACTOR' ? 'before overhead' : 'amount'}.
+                  Verification: Resources total matches BOQ total {project.mode === 'CONTRACTOR' ? 'before overhead' : 'amount'}.
                 </p>
               </div>
             </motion.div>
@@ -1562,16 +1755,28 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
                       const norm = norms.find(n => n.id === item.norm_id);
                       if (!norm) return null;
 
+                      // Calculate transport summary for this item
+                      const transportSummary = transportMaterials.filter(tm => 
+                        norm.resources.some(r => r.resource_type === 'Material' && r.name === tm.material_name)
+                      );
+
                       return (
                         <>
                           <div className="flex justify-between items-start border-b border-black/10 pb-6">
                             <div>
                               <h3 className="text-xl font-bold tracking-tight mb-1">{item.description}</h3>
-                              <p className="text-xs text-black/40 font-medium">Analysis for {norm.basis_quantity} {norm.unit} | Project Mode: {project.mode}</p>
+                              <p className="text-xs text-black/40 font-medium">
+                                Analysis for {norm.basis_quantity} {norm.unit} | Project Mode: {project.mode}
+                              </p>
                             </div>
                             <div className="text-right">
                               <p className="text-[10px] font-bold uppercase tracking-widest text-black/40 mb-1">Unit Rate</p>
-                              <p className="text-2xl font-bold tracking-tighter text-emerald-600">Rs. {formatNumber(calculateItemRate(item.norm_id)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                              <p className="text-2xl font-bold tracking-tighter text-emerald-600">
+                                Rs. {formatNumber(itemRates[item.id] || calculateItemRate(item.norm_id)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              </p>
+                              {transportSummary.length > 0 && (
+                                <p className="text-[8px] text-blue-600 mt-1">Includes Transport</p>
+                              )}
                             </div>
                           </div>
 
@@ -1586,6 +1791,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
                               overrides={overrides}
                               onSaveOverride={handleSaveOverride}
                               formatNumber={formatNumber}
+                              transportMaterials={transportMaterials}
                             />
                             <ProjectAnalysisTable 
                               title="Material" 
@@ -1597,6 +1803,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
                               overrides={overrides}
                               onSaveOverride={handleSaveOverride}
                               formatNumber={formatNumber}
+                              transportMaterials={transportMaterials}
                             />
                             <ProjectAnalysisTable 
                               title="Equipment" 
@@ -1608,8 +1815,36 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
                               overrides={overrides}
                               onSaveOverride={handleSaveOverride}
                               formatNumber={formatNumber}
+                              transportMaterials={transportMaterials}
                             />
                           </div>
+
+                          {/* Transport Summary */}
+                          {transportSummary.length > 0 && (
+                            <div className="mt-8 p-4 bg-blue-50 rounded-2xl">
+                              <h4 className="text-xs font-bold uppercase tracking-widest text-blue-800 mb-3">Transportation Cost Breakdown</h4>
+                              <table className="w-full text-xs">
+                                <thead>
+                                  <tr className="text-left text-blue-600/60">
+                                    <th className="pb-2">Material</th>
+                                    <th className="pb-2 text-right">Unit Weight (kg)</th>
+                                    <th className="pb-2 text-right">Category</th>
+                                    <th className="pb-2 text-right">Transport Cost/Unit</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {transportSummary.map((tm, idx) => (
+                                    <tr key={idx}>
+                                      <td className="py-1 font-medium">{tm.material_name}</td>
+                                      <td className="py-1 text-right">{tm.unit_weight}</td>
+                                      <td className="py-1 text-right">{tm.load_category}</td>
+                                      <td className="py-1 text-right font-bold">Rs. {tm.total_cost_per_unit.toFixed(2)}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
                         </>
                       );
                     })()}
@@ -1968,8 +2203,8 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
         </AnimatePresence>
       </div>
 
-      {/* Add Item Modal with Search */}
-      {isAddModalOpen && (
+      {/* Add Item Modal with Search - Only shown in Estimate tab */}
+      {isAddModalOpen && activeQuantityType === 'ESTIMATE' && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[100] p-4">
           <motion.div 
             initial={{ opacity: 0, scale: 0.95 }}
@@ -2042,16 +2277,16 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
                 </div>
               )}
 
-              {/* Quantity Input */}
+              {/* Estimate Quantity Input */}
               <div className="space-y-2">
-                <label className="text-[10px] font-bold uppercase tracking-widest text-black/40">Quantity</label>
+                <label className="text-[10px] font-bold uppercase tracking-widest text-black/40">Estimate Quantity</label>
                 <div className="flex gap-4 items-center">
                   <input 
                     type="number" 
                     className="flex-1 p-3 bg-[#F5F5F0] rounded-xl border-none focus:ring-2 focus:ring-black/5 text-sm font-bold"
-                    placeholder="Enter quantity"
-                    value={newItem.quantity || ''}
-                    onChange={e => setNewItem({ ...newItem, quantity: parseFloat(e.target.value) })}
+                    placeholder="Enter estimate quantity"
+                    value={newItem.estimate_quantity || ''}
+                    onChange={e => setNewItem({ ...newItem, estimate_quantity: parseFloat(e.target.value) })}
                     step="0.01"
                     min="0"
                   />
@@ -2059,6 +2294,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
                     {norms.find(n => n.id === newItem.norm_id)?.unit || 'unit'}
                   </span>
                 </div>
+                <p className="text-xs text-black/40 italic">Measurement quantity will start at 0</p>
               </div>
 
               {/* Rate Preview */}
@@ -2069,6 +2305,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
                     <p className="text-xs font-bold text-blue-900 uppercase tracking-widest mb-1">Rate Preview</p>
                     <p className="text-sm text-blue-800">
                       Calculated Rate: <span className="font-bold">Rs. {formatNumber(calculateItemRate(newItem.norm_id)).toLocaleString()}</span> per {norms.find(n => n.id === newItem.norm_id)?.unit}
+                      {transportMaterials.length > 0 && ' (includes transport)'}
                     </p>
                   </div>
                 </div>
@@ -2092,7 +2329,7 @@ export default function ProjectBOQ({ projectId, onBack }: { projectId: number, o
   );
 }
 
-function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResources, overrides, onSaveOverride, formatNumber }: { 
+function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResources, overrides, onSaveOverride, formatNumber, transportMaterials }: { 
   title: string, 
   resources: any[], 
   rates: Rate[], 
@@ -2101,7 +2338,8 @@ function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResour
   allResources: any[],
   overrides: RateOverride[],
   onSaveOverride: (normId: number, resourceName: string, overrideRate: number | null, overrideQuantity: number | null) => void,
-  formatNumber: (num: number) => number
+  formatNumber: (num: number) => number,
+  transportMaterials: TransportMaterialRow[]
 }) {
   const [editingResource, setEditingResource] = useState<string | null>(null);
   const [editRateValue, setEditRateValue] = useState<number>(0);
@@ -2109,6 +2347,11 @@ function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResour
 
   const getOverride = (resourceName: string) => {
     return overrides.find(o => o.norm_id === normId && o.resource_name === resourceName);
+  };
+
+  const getTransportCost = (resourceName: string): number => {
+    const transport = transportMaterials.find(tm => tm.material_name === resourceName);
+    return transport?.total_cost_per_unit || 0;
   };
 
   const labourTotal = allResources.reduce((acc, res) => {
@@ -2135,6 +2378,12 @@ function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResour
     return acc + (quantity * rate);
   }, 0);
 
+  const transportTotal = allResources.reduce((acc, res) => {
+    if (res.is_percentage || res.resource_type !== 'Material') return acc;
+    const quantity = getOverride(res.name)?.override_quantity ?? res.quantity;
+    return acc + (quantity * getTransportCost(res.name));
+  }, 0);
+
   const equipmentTotal = allResources.reduce((acc, res) => {
     if (res.is_percentage || res.resource_type !== 'Equipment') return acc;
     const override = getOverride(res.name);
@@ -2147,7 +2396,7 @@ function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResour
     return acc + (quantity * rate);
   }, 0);
 
-  const fixedTotal = labourTotal + materialTotal + equipmentTotal;
+  const fixedTotal = labourTotal + materialTotal + equipmentTotal + transportTotal;
 
   if (resources.length === 0) return null;
 
@@ -2183,6 +2432,7 @@ function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResour
             <th className="pb-2 font-medium text-center">Quantity</th>
             <th className="pb-2 font-medium text-right">Rate</th>
             <th className="pb-2 font-medium text-right">Amount</th>
+            {title === 'Material' && <th className="pb-2 font-medium text-right">Transport</th>}
             <th className="pb-2 font-medium text-center">Actions</th>
           </tr>
         </thead>
@@ -2192,6 +2442,7 @@ function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResour
             const isEditing = editingResource === res.name;
             
             let amount = 0;
+            let transportCost = 0;
             let rateDisplay = '';
             const rateObj = rates.find(r => r.name.toLowerCase() === res.name.toLowerCase());
 
@@ -2199,7 +2450,7 @@ function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResour
               let base = 0;
               if (res.percentage_base === 'TOTAL') base = fixedTotal;
               else if (res.percentage_base === 'LABOUR') base = labourTotal;
-              else if (res.percentage_base === 'MATERIAL') base = materialTotal;
+              else if (res.percentage_base === 'MATERIAL') base = materialTotal + transportTotal;
               else if (res.percentage_base === 'EQUIPMENT') base = equipmentTotal;
               else {
                 const baseRes = allResources.find(r => r.name === res.percentage_base && !r.is_percentage);
@@ -2212,6 +2463,11 @@ function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResour
                     if (rateObj?.apply_vat) rate = rate * 1.13;
                   }
                   base = quantity * rate;
+                  
+                  // Add transport if base is material
+                  if (baseRes.resource_type === 'Material') {
+                    base += quantity * getTransportCost(baseRes.name);
+                  }
                 }
               }
               amount = (res.quantity / 100) * base;
@@ -2222,6 +2478,10 @@ function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResour
               if (mode === 'USERS' && rateObj?.apply_vat) rate = rate * 1.13;
               amount = quantity * rate;
               rateDisplay = rate.toLocaleString();
+              
+              if (res.resource_type === 'Material') {
+                transportCost = quantity * getTransportCost(res.name);
+              }
             }
 
             const hasOverride = override && (override.override_rate !== null || override.override_quantity !== null);
@@ -2233,6 +2493,11 @@ function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResour
                   {hasOverride && (
                     <span className="ml-2 text-[8px] font-bold uppercase tracking-widest text-amber-600 bg-amber-100 px-1.5 py-0.5 rounded">
                       Override
+                    </span>
+                  )}
+                  {res.resource_type === 'Material' && getTransportCost(res.name) > 0 && (
+                    <span className="ml-2 text-[8px] font-bold uppercase tracking-widest text-blue-600 bg-blue-100 px-1.5 py-0.5 rounded">
+                      Transport
                     </span>
                   )}
                 </td>
@@ -2275,6 +2540,11 @@ function ProjectAnalysisTable({ title, resources, rates, mode, normId, allResour
                   )}
                 </td>
                 <td className="py-2 text-right font-mono font-bold">Rs. {formatNumber(amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                {title === 'Material' && (
+                  <td className="py-2 text-right font-mono text-blue-600">
+                    {transportCost > 0 ? `Rs. ${formatNumber(transportCost).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '-'}
+                  </td>
+                )}
                 <td className="py-2 text-center">
                   {!res.is_percentage && (
                     <div className="flex items-center justify-center gap-1">

@@ -23,7 +23,13 @@ async function startServer() {
   app.use(express.json({ limit: '10mb' }));
   const PORT = 3000;
 
-  // Initialize Tables
+  // Add request logging middleware
+  app.use((req, res, next) => {
+    console.log(`📨 ${req.method} ${req.path}`);
+    next();
+  });
+
+  // Initialize Tables with updated schema
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS norms (
@@ -63,14 +69,17 @@ async function startServer() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
+      -- UPDATED: Added estimate_quantity and measurement_quantity columns
       CREATE TABLE IF NOT EXISTS boq_items (
         id SERIAL PRIMARY KEY,
         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
         norm_id INTEGER NOT NULL REFERENCES norms(id),
-        quantity REAL NOT NULL
+        quantity REAL NOT NULL DEFAULT 0, -- Kept for backward compatibility
+        estimate_quantity REAL DEFAULT 0,
+        measurement_quantity REAL DEFAULT 0,
+        quantity_type TEXT DEFAULT 'ESTIMATE' CHECK (quantity_type IN ('ESTIMATE', 'MEASUREMENT'))
       );
 
-      -- Project-specific rate overrides
       CREATE TABLE IF NOT EXISTS project_rate_overrides (
         id SERIAL PRIMARY KEY,
         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -82,25 +91,18 @@ async function startServer() {
         UNIQUE(project_id, norm_id, resource_name)
       );
 
-      -- Transportation settings per project
       CREATE TABLE IF NOT EXISTS project_transport_settings (
         project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
         transport_mode TEXT DEFAULT 'TRUCK',
         metalled_distance REAL DEFAULT 0,
         gravelled_distance REAL DEFAULT 0,
         porter_distance REAL DEFAULT 0,
-        
-        -- Porter coefficients (per kg per kosh)
         porter_easy REAL DEFAULT 2.5,
         porter_difficult REAL DEFAULT 3.6,
         porter_vdifficult REAL DEFAULT 6.1,
         porter_high_volume REAL DEFAULT 4.9,
-        
-        -- Tractor road coefficients (per kg per km)
         tractor_metalled REAL DEFAULT 0.074,
         tractor_gravelled REAL DEFAULT 0.075,
-        
-        -- Truck road coefficients (per kg per kosh)
         truck_metalled_easy REAL DEFAULT 0.02,
         truck_metalled_difficult REAL DEFAULT 0.02,
         truck_metalled_vdifficult REAL DEFAULT 0.022,
@@ -109,12 +111,10 @@ async function startServer() {
         truck_gravelled_difficult REAL DEFAULT 0.063,
         truck_gravelled_vdifficult REAL DEFAULT 0.063,
         truck_gravelled_high_volume REAL DEFAULT 0.025,
-        
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
-      -- Material transportation data per project
       CREATE TABLE IF NOT EXISTS project_material_transport (
         id SERIAL PRIMARY KEY,
         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -127,12 +127,23 @@ async function startServer() {
       );
     `);
     console.log("✅ Database tables verified/created.");
+    
+    // Optional: Migrate existing data to set estimate_quantity = quantity for backward compatibility
+    await pool.query(`
+      UPDATE boq_items 
+      SET estimate_quantity = quantity 
+      WHERE estimate_quantity = 0 AND quantity > 0
+    `);
+    console.log("✅ Backward compatibility migration completed.");
+    
   } catch (err) {
     console.error("❌ Database init error:", err);
   }
 
-  // --- API Routes ---
+  // ==================== API ROUTES ====================
+  // All API routes must come BEFORE the Vite/static handling
 
+  // Health check
   app.get("/api/health", async (req, res) => {
     try {
       const result = await pool.query("SELECT COUNT(*) FROM norms");
@@ -142,21 +153,29 @@ async function startServer() {
     }
   });
 
-  // GET ALL NORMS
+  // ===== NORMS ROUTES =====
   app.get("/api/norms", async (req, res) => {
     try {
       const { rows: norms } = await pool.query("SELECT * FROM norms ORDER BY id DESC");
-      const result = await Promise.all(norms.map(async (norm: any) => {
-        const { rows: resources } = await pool.query("SELECT * FROM norm_resources WHERE norm_id = $1", [norm.id]);
-        return { ...norm, resources };
-      }));
+      if (norms.length === 0) return res.json([]);
+      const normIds = norms.map((n: any) => n.id);
+      const { rows: resources } = await pool.query(
+        "SELECT * FROM norm_resources WHERE norm_id = ANY($1::int[])",
+        [normIds]
+      );
+      const byNorm = new Map<number, any[]>();
+      for (const r of resources) {
+        const nid = r.norm_id;
+        if (!byNorm.has(nid)) byNorm.set(nid, []);
+        byNorm.get(nid)!.push(r);
+      }
+      const result = norms.map((n: any) => ({ ...n, resources: byNorm.get(n.id) || [] }));
       res.json(result);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
   });
 
-  // CREATE NORM
   app.post("/api/norms", async (req, res) => {
     const client = await pool.connect();
     try {
@@ -197,7 +216,6 @@ async function startServer() {
     }
   });
 
-  // UPDATE NORM
   app.put("/api/norms/:id", async (req, res) => {
     const client = await pool.connect();
     try {
@@ -240,7 +258,6 @@ async function startServer() {
     }
   });
 
-  // DELETE NORM
   app.delete("/api/norms/:id", async (req, res) => {
     try {
       const { id } = req.params;
@@ -251,7 +268,7 @@ async function startServer() {
     }
   });
 
-  // RATES
+  // ===== RATES ROUTES =====
   app.get("/api/rates", async (req, res) => {
     try {
       const { rows } = await pool.query("SELECT * FROM rates ORDER BY name ASC");
@@ -274,7 +291,7 @@ async function startServer() {
     }
   });
 
-  // PROJECTS
+  // ===== PROJECTS ROUTES =====
   app.get("/api/projects", async (req, res) => {
     try {
       const { rows } = await pool.query("SELECT * FROM projects ORDER BY created_at DESC");
@@ -284,24 +301,71 @@ async function startServer() {
     }
   });
 
+  // UPDATED: Include estimate_quantity and measurement_quantity in project details
   app.get("/api/projects/:id", async (req, res) => {
     try {
       const { rows: projects } = await pool.query("SELECT * FROM projects WHERE id = $1", [req.params.id]);
       if (projects.length === 0) return res.status(404).json({ error: "Project not found" });
-      
       const { rows: items } = await pool.query(`
-        SELECT b.*, n.description, n.unit, n.basis_quantity, n.ref_ss 
+        SELECT b.*, n.type, n.description, n.unit, n.basis_quantity, n.ref_ss 
         FROM boq_items b 
         JOIN norms n ON b.norm_id = n.id 
         WHERE b.project_id = $1
       `, [req.params.id]);
-      
-      const itemsWithResources = await Promise.all(items.map(async (item: any) => {
-        const { rows: resources } = await pool.query("SELECT * FROM norm_resources WHERE norm_id = $1", [item.norm_id]);
-        return { ...item, resources };
-      }));
+      res.json({ ...projects[0], items });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
 
-      res.json({ ...projects[0], items: itemsWithResources });
+  // UPDATED: Include both quantities in full data response
+  app.get("/api/projects/:id/full", async (req, res) => {
+    try {
+      const id = req.params.id;
+      const [
+        projRes,
+        itemsRes,
+        normsRes,
+        ratesRes,
+        overridesRes,
+        transportRes,
+        materialsRes
+      ] = await Promise.all([
+        pool.query("SELECT * FROM projects WHERE id = $1", [id]),
+        pool.query(`
+          SELECT b.*, n.type, n.description, n.unit, n.basis_quantity, n.ref_ss 
+          FROM boq_items b 
+          JOIN norms n ON b.norm_id = n.id 
+          WHERE b.project_id = $1
+        `, [id]),
+        pool.query("SELECT * FROM norms ORDER BY id DESC"),
+        pool.query("SELECT * FROM rates ORDER BY name ASC"),
+        pool.query("SELECT * FROM project_rate_overrides WHERE project_id = $1", [id]),
+        pool.query("SELECT * FROM project_transport_settings WHERE project_id = $1", [id]),
+        pool.query("SELECT * FROM project_material_transport WHERE project_id = $1 ORDER BY material_name", [id])
+      ]);
+      const projects = projRes.rows;
+      if (projects.length === 0) return res.status(404).json({ error: "Project not found" });
+      const norms = normsRes.rows;
+      const normIds = norms.map((n: any) => n.id);
+      const resources = normIds.length > 0
+        ? (await pool.query("SELECT * FROM norm_resources WHERE norm_id = ANY($1::int[])", [normIds])).rows
+        : [];
+      const byNorm = new Map<number, any[]>();
+      for (const r of resources) {
+        const nid = r.norm_id;
+        if (!byNorm.has(nid)) byNorm.set(nid, []);
+        byNorm.get(nid)!.push(r);
+      }
+      const normsWithResources = norms.map((n: any) => ({ ...n, resources: byNorm.get(n.id) || [] }));
+      res.json({
+        project: { ...projects[0], items: itemsRes.rows },
+        norms: normsWithResources,
+        rates: ratesRes.rows,
+        overrides: overridesRes.rows,
+        transportSettings: transportRes.rows[0] || null,
+        materialTransport: materialsRes.rows
+      });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -320,35 +384,102 @@ async function startServer() {
     }
   });
 
-  // BOQ ITEMS
+  // DELETE PROJECT ROUTE
+  app.delete("/api/projects/:id", async (req, res) => {
+    console.log(`🗑️ DELETE request received for project ID: ${req.params.id}`);
+    
+    try {
+      const { id } = req.params;
+      
+      if (!id || isNaN(parseInt(id))) {
+        console.log(`❌ Invalid project ID: ${id}`);
+        return res.status(400).json({ error: "Invalid project ID" });
+      }
+
+      const projectCheck = await pool.query("SELECT id, name FROM projects WHERE id = $1", [id]);
+      if (projectCheck.rows.length === 0) {
+        console.log(`❌ Project ${id} not found`);
+        return res.status(404).json({ error: "Project not found" });
+      }
+
+      const projectName = projectCheck.rows[0].name;
+      console.log(`✅ Found project: "${projectName}" (ID: ${id})`);
+
+      const result = await pool.query("DELETE FROM projects WHERE id = $1 RETURNING id", [id]);
+      
+      console.log(`✅ Project ${id} deleted successfully`);
+      
+      res.status(200).json({ 
+        success: true, 
+        message: `Project "${projectName}" deleted successfully`,
+        deletedId: parseInt(id)
+      });
+      
+    } catch (e: any) {
+      console.error("❌ Error deleting project:", e);
+      res.status(500).json({ 
+        error: e.message || "An error occurred while deleting the project" 
+      });
+    }
+  });
+
+  // ===== BOQ ITEMS ROUTES =====
+  // UPDATED: Accept both quantities when creating BOQ item
   app.post("/api/projects/:id/items", async (req, res) => {
-    const { norm_id, quantity } = req.body;
+    const { norm_id, estimate_quantity, measurement_quantity } = req.body;
+    const quantity = estimate_quantity || measurement_quantity || 0; // For backward compatibility
+    
     try {
       const result = await pool.query(
-        "INSERT INTO boq_items (project_id, norm_id, quantity) VALUES ($1, $2, $3) RETURNING id",
-        [req.params.id, norm_id, quantity]
+        `INSERT INTO boq_items (project_id, norm_id, quantity, estimate_quantity, measurement_quantity) 
+         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+        [req.params.id, norm_id, quantity, estimate_quantity || 0, measurement_quantity || 0]
       );
-      res.json({ id: result.rows[0].id });
+      
+      // Return the newly created item with details
+      const newItem = await pool.query(`
+        SELECT b.*, n.type, n.description, n.unit, n.basis_quantity, n.ref_ss 
+        FROM boq_items b 
+        JOIN norms n ON b.norm_id = n.id 
+        WHERE b.id = $1
+      `, [result.rows[0].id]);
+      
+      res.json(newItem.rows[0]);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
   });
 
-  // UPDATE BOQ ITEM
+  // UPDATED: Update both quantities when updating BOQ item
   app.put("/api/boq-items/:id", async (req, res) => {
-    const { quantity, norm_id } = req.body;
+    const { estimate_quantity, measurement_quantity, norm_id } = req.body;
+    const quantity = estimate_quantity || measurement_quantity || 0; // For backward compatibility
+    
     try {
       await pool.query(
-        "UPDATE boq_items SET quantity = $1, norm_id = COALESCE($2, norm_id) WHERE id = $3",
-        [quantity, norm_id, req.params.id]
+        `UPDATE boq_items 
+         SET quantity = $1, 
+             estimate_quantity = COALESCE($2, estimate_quantity), 
+             measurement_quantity = COALESCE($3, measurement_quantity),
+             norm_id = COALESCE($4, norm_id)
+         WHERE id = $5`,
+        [quantity, estimate_quantity, measurement_quantity, norm_id, req.params.id]
       );
-      res.json({ success: true });
+      
+      // Return updated item
+      const updatedItem = await pool.query(`
+        SELECT b.*, n.type, n.description, n.unit, n.basis_quantity, n.ref_ss 
+        FROM boq_items b 
+        JOIN norms n ON b.norm_id = n.id 
+        WHERE b.id = $1
+      `, [req.params.id]);
+      
+      res.json(updatedItem.rows[0]);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
   });
 
-  // DELETE BOQ ITEM
   app.delete("/api/boq-items/:id", async (req, res) => {
     try {
       await pool.query("DELETE FROM boq_items WHERE id = $1", [req.params.id]);
@@ -358,9 +489,7 @@ async function startServer() {
     }
   });
 
-  // ========== PROJECT-SPECIFIC RATE OVERRIDES ==========
-
-  // Get all overrides for a project
+  // ===== PROJECT-SPECIFIC RATE OVERRIDES =====
   app.get("/api/projects/:projectId/overrides", async (req, res) => {
     try {
       const { rows } = await pool.query(
@@ -373,7 +502,6 @@ async function startServer() {
     }
   });
 
-  // Save or update an override
   app.post("/api/projects/:projectId/overrides", async (req, res) => {
     const { norm_id, resource_name, override_rate, override_quantity } = req.body;
     try {
@@ -390,7 +518,6 @@ async function startServer() {
     }
   });
 
-  // Delete an override
   app.delete("/api/projects/:projectId/overrides", async (req, res) => {
     const { norm_id, resource_name } = req.body;
     try {
@@ -404,9 +531,7 @@ async function startServer() {
     }
   });
 
-  // ========== TRANSPORTATION API ROUTES ==========
-
-  // Get transportation settings for a project
+  // ===== TRANSPORTATION API ROUTES =====
   app.get("/api/projects/:projectId/transport/settings", async (req, res) => {
     try {
       const { rows } = await pool.query(
@@ -415,7 +540,6 @@ async function startServer() {
       );
       
       if (rows.length === 0) {
-        // Create default settings if none exist
         const result = await pool.query(
           `INSERT INTO project_transport_settings (project_id) 
            VALUES ($1) RETURNING *`,
@@ -430,7 +554,6 @@ async function startServer() {
     }
   });
 
-  // Save transportation settings
   app.post("/api/projects/:projectId/transport/settings", async (req, res) => {
     const {
       transport_mode,
@@ -496,7 +619,6 @@ async function startServer() {
     }
   });
 
-  // Get all material transport data for a project
   app.get("/api/projects/:projectId/transport/materials", async (req, res) => {
     try {
       const { rows } = await pool.query(
@@ -509,7 +631,6 @@ async function startServer() {
     }
   });
 
-  // Save material transport data (unit weight and category)
   app.post("/api/projects/:projectId/transport/materials", async (req, res) => {
     const { material_name, unit_weight, load_category } = req.body;
     try {
@@ -529,9 +650,8 @@ async function startServer() {
     }
   });
 
-  // Batch save multiple material transport entries
   app.post("/api/projects/:projectId/transport/materials/batch", async (req, res) => {
-    const { materials } = req.body; // Array of { material_name, unit_weight, load_category }
+    const { materials } = req.body;
     const client = await pool.connect();
     
     try {
@@ -560,16 +680,22 @@ async function startServer() {
     }
   });
 
-  // --- Vite / Static Handling ---
+  // ==================== VITE / STATIC HANDLING ====================
+  // This must come AFTER all API routes
+  
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
+    
+    // Catch-all for SPA - but only for non-API routes
     app.use("*", async (req, res, next) => {
       const url = req.originalUrl;
-      if (url.startsWith('/api')) return next();
+      if (url.startsWith('/api')) {
+        return next();
+      }
       try {
         let template = fs.readFileSync(path.resolve(__dirname, "index.html"), "utf-8");
         template = await vite.transformIndexHtml(url, template);
@@ -582,7 +708,9 @@ async function startServer() {
   } else {
     app.use(express.static(path.join(__dirname, "dist")));
     app.get("*", (req, res, next) => {
-      if (req.originalUrl.startsWith('/api')) return next();
+      if (req.originalUrl.startsWith('/api')) {
+        return next();
+      }
       res.sendFile(path.join(__dirname, "dist", "index.html"));
     });
   }

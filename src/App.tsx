@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, lazy, Suspense } from 'react';
 import { 
   LayoutDashboard, 
   BookOpen, 
@@ -22,7 +22,7 @@ import Norms from './pages/Norms';
 import Rates from './pages/Rates';
 import RateAnalysis from './pages/RateAnalysis';
 import Projects from './pages/Projects';
-import ProjectBOQ from './pages/ProjectBOQ';
+const ProjectBOQ = lazy(() => import('./pages/ProjectBOQ'));
 
 export default function App() {
   const [activePage, setActivePage] = useState('dashboard');
@@ -42,10 +42,16 @@ export default function App() {
       case 'rate-analysis': return <RateAnalysis />;
       case 'projects': return <Projects onSelectProject={navigateToProject} />;
       case 'project-boq': return selectedProjectId ? (
-        <ProjectBOQ 
-          projectId={selectedProjectId} 
-          onBack={() => setActivePage('projects')} 
-        />
+        <Suspense fallback={
+          <div className="flex items-center justify-center min-h-[400px]">
+            <div className="animate-spin rounded-full h-10 w-10 border-2 border-black/20 border-t-black" />
+          </div>
+        }>
+          <ProjectBOQ 
+            projectId={selectedProjectId} 
+            onBack={() => setActivePage('projects')} 
+          />
+        </Suspense>
       ) : <Projects onSelectProject={navigateToProject} />;
       default: return <Dashboard onNavigate={setActivePage} />;
     }
